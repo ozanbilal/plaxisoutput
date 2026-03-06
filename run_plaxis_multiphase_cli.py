@@ -179,6 +179,8 @@ def run_node_mode(args):
         period_start=float(args.period_start),
         period_end=float(args.period_end),
         period_step=float(args.period_step),
+        plot_dpi=int(args.plot_dpi),
+        save_node_timehistory_subfolders=bool(args.save_node_timehistory_subfolders),
         out=args.out,
     )
 
@@ -233,6 +235,7 @@ def run_structural_mode(args):
         plate_group2_names=p2_names,
         plate_group1_merge_single_profile=bool(args.plate1_merge_single_profile),
         plate_group2_merge_single_profile=bool(args.plate2_merge_single_profile),
+        plot_dpi=int(args.plot_dpi),
         out=args.out,
     )
 
@@ -258,6 +261,7 @@ def build_parser():
         sp.add_argument("--out", required=True, help="Output xlsx path.")
         sp.add_argument("--attempts", type=int, default=3)
         sp.add_argument("--retry-sleep", type=float, default=1.0)
+        sp.add_argument("--plot-dpi", type=int, default=180)
 
     n = sub.add_parser("node", help="Run node multi-phase spectrum export.")
     add_common(n)
@@ -267,6 +271,11 @@ def build_parser():
     n.add_argument("--period-start", type=float, default=0.01)
     n.add_argument("--period-end", type=float, default=3.0)
     n.add_argument("--period-step", type=float, default=0.01)
+    n.add_argument(
+        "--save-node-timehistory-subfolders",
+        action="store_true",
+        help="Write per-phase node time history CSV files under an output subfolder.",
+    )
     n.add_argument("--curvepoint-id", action="append", default=[])
     n.add_argument(
         "--curvepoint-regex",

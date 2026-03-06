@@ -978,6 +978,20 @@ def _safe_float_list(values):
     return out
 
 
+def _snap_dt(dt, target=0.01, rel_tol=0.02):
+    try:
+        dt_val = float(dt)
+        target_val = float(target)
+        tol_val = float(rel_tol)
+    except Exception:
+        return dt
+    if dt_val <= 0.0 or target_val <= 0.0 or tol_val < 0.0:
+        return dt
+    if abs(dt_val - target_val) / target_val <= tol_val:
+        return target_val
+    return dt
+
+
 def parse_points_argument(point_values):
     parsed = []
     for point_text in point_values:
@@ -1675,6 +1689,14 @@ def _ensure_plot_dir(base_out_path):
     return plot_dir
 
 
+def _ensure_timehistory_dir(base_out_path):
+    out_path = Path(base_out_path)
+    hist_dir = out_path.with_suffix("")
+    hist_dir = hist_dir.parent / f"{hist_dir.name}_time_history"
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    return hist_dir
+
+
 def _write_multisheet_workbook(out_path, sheets, logger=print):
     writer, out_final = _open_excel_writer_with_fallback(Path(out_path), logger=logger)
     with writer:
@@ -1682,6 +1704,39 @@ def _write_multisheet_workbook(out_path, sheets, logger=print):
             frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
             frame.to_excel(writer, index=False, sheet_name=sheet_name)
     return out_final
+
+
+def _export_node_timehistory_subfolders(time_df, base_out_path, time_col, logger=print):
+    if time_df.empty:
+        return []
+
+    root_dir = _ensure_timehistory_dir(base_out_path)
+    written_paths = []
+    key_rows = (
+        time_df[["Direction", "Phase", "Series", "NodeName", "CurvePointId"]]
+        .drop_duplicates()
+        .itertuples(index=False)
+    )
+    for key in key_rows:
+        direction, phase_name, series_name, node_name, curvepoint_id = key
+        one = time_df[
+            (time_df["Direction"] == direction)
+            & (time_df["Phase"] == phase_name)
+            & (time_df["Series"] == series_name)
+            & (time_df["CurvePointId"] == curvepoint_id)
+        ].copy()
+        if one.empty:
+            continue
+        one = one.sort_values(time_col).reset_index(drop=True)
+        phase_dir = root_dir / _safe_fs_name(_phase_base_name(phase_name))
+        phase_dir.mkdir(parents=True, exist_ok=True)
+        file_name = f"{_safe_fs_name(series_name)}.csv"
+        csv_path = phase_dir / file_name
+        one[["Step", time_col, "Acceleration"]].to_csv(csv_path, index=False)
+        written_paths.append(str(csv_path))
+        if logger is not None:
+            logger(f"TimeHistory -> {csv_path}")
+    return written_paths
 
 
 def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
@@ -1744,6 +1799,8 @@ def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
                     "chart_title": f"{direction} | {series} | Spectrum",
                     "x_axis_title": "Period_s",
                     "y_axis_title": "PSA_g",
+                    "chart_type": "scatter",
+                    "shared_x_col": 1,
                 }
             )
 
@@ -1766,6 +1823,8 @@ def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
                     "chart_title": f"{direction} | Phase Overlay Mean (All Nodes)",
                     "x_axis_title": "Period_s",
                     "y_axis_title": "PSA_g",
+                    "chart_type": "scatter",
+                    "shared_x_col": 1,
                 }
             )
 
@@ -1791,6 +1850,8 @@ def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
                     "chart_title": f"{direction} | Node Mean Spectra Overlay",
                     "x_axis_title": "Period_s",
                     "y_axis_title": "PSA_g",
+                    "chart_type": "scatter",
+                    "shared_x_col": 1,
                 }
             )
 
@@ -1819,39 +1880,44 @@ def _build_structural_moment_wide_specs(avg_df):
             sub = dir_df[dir_df["ObjectGroup"] == object_group].copy()
             if sub.empty:
                 continue
-
-            depth_map = (
-                sub[["DepthRound", "Depth"]]
-                .dropna(subset=["DepthRound", "Depth"])
-                .groupby("DepthRound", as_index=False)
-                .agg(Depth=("Depth", "mean"))
-                .sort_values("Depth")
-                .reset_index(drop=True)
-            )
-            if depth_map.empty:
-                continue
-
-            wide = depth_map.copy()
-            ordered_cols = ["Depth"]
+            frames = []
+            series_pairs = []
+            col_cursor = 1
             object_names = sorted(sub["ObjectName"].dropna().unique().tolist())
             for object_name in object_names:
-                one = sub[sub["ObjectName"] == object_name][["DepthRound", "MPlus", "MMinus"]].copy()
                 one = (
-                    one.groupby("DepthRound", as_index=False)
-                    .agg(MPlus=("MPlus", "mean"), MMinus=("MMinus", "mean"))
-                    .sort_values("DepthRound")
+                    sub[sub["ObjectName"] == object_name][["Depth", "MPlus", "MMinus"]]
+                    .dropna(subset=["Depth"])
+                    .sort_values("Depth")
+                    .reset_index(drop=True)
                 )
+                if one.empty:
+                    continue
+                c_depth = f"{object_name}_Depth"
                 c_plus = f"{object_name}_MPlus"
                 c_minus = f"{object_name}_MMinus"
-                one = one.rename(columns={"MPlus": c_plus, "MMinus": c_minus})
-                wide = wide.merge(one, on="DepthRound", how="left")
-                ordered_cols.extend([c_plus, c_minus])
+                one = one.rename(columns={"Depth": c_depth, "MPlus": c_plus, "MMinus": c_minus})
+                frames.append(one[[c_depth, c_plus, c_minus]])
+                series_pairs.append(
+                    {
+                        "x_col": col_cursor,
+                        "y_col": col_cursor + 1,
+                        "title": c_plus,
+                    }
+                )
+                series_pairs.append(
+                    {
+                        "x_col": col_cursor,
+                        "y_col": col_cursor + 2,
+                        "title": c_minus,
+                    }
+                )
+                col_cursor += 3
 
-            keep_cols = ["DepthRound", "Depth"] + [
-                c for c in ordered_cols[1:] if c in wide.columns
-            ]
-            wide = wide[keep_cols].sort_values("Depth").reset_index(drop=True)
-            wide = wide.drop(columns=["DepthRound"])
+            if not frames:
+                continue
+
+            wide = pd.concat(frames, axis=1)
             sheet_name = _unique_sheet_name(f"MomentWide_{direction}_{object_group}", used_names)
             specs.append(
                 {
@@ -1860,7 +1926,8 @@ def _build_structural_moment_wide_specs(avg_df):
                     "chart_title": f"{direction} | {object_group} | Moment-Depth",
                     "x_axis_title": "Depth",
                     "y_axis_title": "Moment (kNm)",
-                    "reverse_x_axis": True,
+                    "chart_type": "scatter",
+                    "series_pairs": series_pairs,
                     "chart_width": 18.5,
                     "chart_height": 9.5,
                 }
@@ -1874,7 +1941,8 @@ def _add_excel_line_charts(workbook_path, chart_specs, logger=print):
         return
 
     from openpyxl import load_workbook
-    from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart import LineChart, Reference, ScatterChart, Series
+    from openpyxl.chart.axis import ChartLines
     from openpyxl.utils import get_column_letter
 
     wb = load_workbook(workbook_path)
@@ -1889,7 +1957,12 @@ def _add_excel_line_charts(workbook_path, chart_specs, logger=print):
         if max_row < 2 or max_col < 2:
             continue
 
-        chart = LineChart()
+        chart_type = str(spec.get("chart_type") or "scatter").strip().lower()
+        if chart_type == "line":
+            chart = LineChart()
+        else:
+            chart = ScatterChart()
+            chart.scatterStyle = "line"
         chart.title = str(spec.get("chart_title") or sheet_name)
         chart.style = 2
         chart.y_axis.title = str(spec.get("y_axis_title") or "Value")
@@ -1897,16 +1970,44 @@ def _add_excel_line_charts(workbook_path, chart_specs, logger=print):
         chart.height = float(spec.get("chart_height") or 9.0)
         chart.width = float(spec.get("chart_width") or 16.5)
         chart.legend.position = "r"
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.x_axis.tickLblPos = "nextTo"
+        chart.y_axis.tickLblPos = "nextTo"
+        chart.x_axis.majorTickMark = "out"
+        chart.y_axis.majorTickMark = "out"
+        chart.x_axis.numFmt = str(spec.get("x_num_fmt") or "0.00")
+        chart.y_axis.numFmt = str(spec.get("y_num_fmt") or "0.000")
+        chart.x_axis.majorGridlines = ChartLines()
+        chart.y_axis.majorGridlines = ChartLines()
         if bool(spec.get("reverse_x_axis", False)):
             try:
                 chart.x_axis.scaling.orientation = "maxMin"
             except Exception:
                 pass
 
-        data = Reference(ws, min_col=2, min_row=1, max_col=max_col, max_row=max_row)
-        cats = Reference(ws, min_col=1, min_row=2, max_row=max_row)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
+        if chart_type == "line":
+            data = Reference(ws, min_col=2, min_row=1, max_col=max_col, max_row=max_row)
+            cats = Reference(ws, min_col=1, min_row=2, max_row=max_row)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+        else:
+            series_pairs = list(spec.get("series_pairs") or [])
+            shared_x_col = int(spec.get("shared_x_col") or 0)
+            if series_pairs:
+                for pair in series_pairs:
+                    x_col = int(pair["x_col"])
+                    y_col = int(pair["y_col"])
+                    xvalues = Reference(ws, min_col=x_col, min_row=2, max_row=max_row)
+                    yvalues = Reference(ws, min_col=y_col, min_row=1, max_row=max_row)
+                    series = Series(yvalues, xvalues, title_from_data=True)
+                    chart.series.append(series)
+            elif shared_x_col > 0:
+                xvalues = Reference(ws, min_col=shared_x_col, min_row=2, max_row=max_row)
+                for y_col in range(shared_x_col + 1, max_col + 1):
+                    yvalues = Reference(ws, min_col=y_col, min_row=1, max_row=max_row)
+                    series = Series(yvalues, xvalues, title_from_data=True)
+                    chart.series.append(series)
 
         anchor_col = min(max_col + 2, 50)
         ws.add_chart(chart, f"{get_column_letter(anchor_col)}2")
@@ -1927,7 +2028,67 @@ def _mpl_pyplot():
     return plt
 
 
-def _plot_moment_group(avg_df, direction, object_group, out_png):
+def _phase_base_name(phase_name):
+    text = str(phase_name or "").strip()
+    if " [" in text:
+        return text.split(" [", 1)[0].strip()
+    return text
+
+
+def _safe_fs_name(name):
+    text = re.sub(r'[<>:"/\\|?*]+', "_", str(name or "").strip())
+    text = text.strip(" .")
+    return text or "item"
+
+
+def _short_plot_label(text, max_len=40):
+    out = str(text or "").strip()
+    if len(out) <= max_len:
+        return out
+    return f"{out[: max_len - 3].rstrip()}..."
+
+
+def _apply_compact_legend(fig, ax):
+    handles, labels = ax.get_legend_handles_labels()
+    items = [(h, l) for h, l in zip(handles, labels) if l and l != "_nolegend_"]
+    if len(items) <= 1:
+        fig.tight_layout()
+        return
+
+    handles = [item[0] for item in items]
+    labels = [item[1] for item in items]
+    if len(labels) <= 6:
+        ncol = min(3, max(1, math.ceil(len(labels) / 2)))
+        ax.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.16),
+            fontsize=7,
+            ncol=ncol,
+            frameon=True,
+            columnspacing=0.9,
+            handlelength=1.8,
+            borderaxespad=0.3,
+        )
+        fig.tight_layout(rect=(0, 0.1, 1, 1))
+        return
+
+    ax.legend(
+        handles,
+        labels,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        fontsize=7,
+        ncol=1,
+        frameon=True,
+        handlelength=1.6,
+        borderaxespad=0.3,
+    )
+    fig.tight_layout(rect=(0, 0, 0.82, 1))
+
+
+def _plot_moment_group(avg_df, direction, object_group, out_png, dpi=150):
     subset = avg_df[
         (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
     ].copy()
@@ -1942,14 +2103,15 @@ def _plot_moment_group(avg_df, direction, object_group, out_png):
     for idx, name in enumerate(names):
         one = subset[subset["ObjectName"] == name].sort_values("Depth")
         color = cmap(idx % cmap.N)
-        ax.plot(one["MPlus"], one["Depth"], color=color, linewidth=1.7, label=f"{name} M+")
+        label_name = _short_plot_label(name, max_len=28)
+        ax.plot(one["MPlus"], one["Depth"], color=color, linewidth=1.7, label=f"{label_name} M+")
         ax.plot(
             one["MMinus"],
             one["Depth"],
             color=color,
             linewidth=1.3,
             linestyle="--",
-            label=f"{name} M-",
+            label=f"{label_name} M-",
         )
 
     ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.7)
@@ -1957,15 +2119,14 @@ def _plot_moment_group(avg_df, direction, object_group, out_png):
     ax.set_xlabel("Moment (kNm)")
     ax.set_ylabel("Depth")
     ax.set_title(f"{direction} Direction | {object_group} | Mean +/- Envelope")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, ncol=1)
     ax.grid(True, alpha=0.25)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
-    fig.savefig(out_png, dpi=150)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
     return True
 
 
-def _plot_node_timehistory(direction, series_name, frame, out_png, time_col):
+def _plot_node_timehistory(direction, series_name, frame, out_png, time_col, dpi=150):
     if frame.empty:
         return False
     plt = _mpl_pyplot()
@@ -1973,19 +2134,24 @@ def _plot_node_timehistory(direction, series_name, frame, out_png, time_col):
     phases = sorted(frame["Phase"].unique().tolist())
     for phase_name in phases:
         one = frame[frame["Phase"] == phase_name].sort_values(time_col)
-        ax.plot(one[time_col], one["Acceleration"], linewidth=1.0, alpha=0.9, label=phase_name)
+        ax.plot(
+            one[time_col],
+            one["Acceleration"],
+            linewidth=1.0,
+            alpha=0.9,
+            label=_short_plot_label(_phase_base_name(phase_name), max_len=36),
+        )
     ax.set_xlabel(time_col)
     ax.set_ylabel("Acceleration")
     ax.set_title(f"{direction} | {series_name} | Acceleration-Time")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
     ax.grid(True, alpha=0.25)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
-    fig.savefig(out_png, dpi=150)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
     return True
 
 
-def _plot_node_spectrum_single(direction, series_name, long_df, mean_df, out_png):
+def _plot_node_spectrum_single(direction, series_name, long_df, mean_df, out_png, dpi=150):
     if long_df.empty and mean_df.empty:
         return False
     plt = _mpl_pyplot()
@@ -1999,7 +2165,7 @@ def _plot_node_spectrum_single(direction, series_name, long_df, mean_df, out_png
                 one["PSA_g"],
                 linewidth=1.0,
                 alpha=0.55,
-                label=phase_name,
+                label=_short_plot_label(_phase_base_name(phase_name), max_len=36),
             )
     if not mean_df.empty:
         one_mean = mean_df.sort_values("Period_s")
@@ -2013,15 +2179,14 @@ def _plot_node_spectrum_single(direction, series_name, long_df, mean_df, out_png
     ax.set_xlabel("Period_s")
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | {series_name} | Spectrum")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
     ax.grid(True, alpha=0.25)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
-    fig.savefig(out_png, dpi=150)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
     return True
 
 
-def _plot_node_spectrum_group_phase(direction, long_df, out_png):
+def _plot_node_spectrum_group_phase(direction, long_df, out_png, dpi=150):
     subset = long_df[long_df["Direction"] == direction].copy()
     if subset.empty:
         return False
@@ -2033,21 +2198,20 @@ def _plot_node_spectrum_group_phase(direction, long_df, out_png):
         series_name, phase_name = key
         one = subset[(subset["Series"] == series_name) & (subset["Phase"] == phase_name)]
         one = one.sort_values("Period_s")
-        label = phase_name if phase_name not in seen_phase else "_nolegend_"
+        label = _phase_base_name(phase_name) if phase_name not in seen_phase else "_nolegend_"
         seen_phase.add(phase_name)
         ax.plot(one["Period_s"], one["PSA_g"], linewidth=0.9, alpha=0.4, label=label)
     ax.set_xlabel("Period_s")
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | All Node Spectra (Phase-Based Overlay)")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
     ax.grid(True, alpha=0.25)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
-    fig.savefig(out_png, dpi=150)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
     return True
 
 
-def _plot_node_spectrum_group_mean(direction, mean_df, out_png):
+def _plot_node_spectrum_group_mean(direction, mean_df, out_png, dpi=150):
     subset = mean_df[mean_df["Direction"] == direction].copy()
     if subset.empty:
         return False
@@ -2056,14 +2220,18 @@ def _plot_node_spectrum_group_mean(direction, mean_df, out_png):
     names = sorted(subset["Series"].unique().tolist())
     for name in names:
         one = subset[subset["Series"] == name].sort_values("Period_s")
-        ax.plot(one["Period_s"], one["PSA_g"], linewidth=1.4, label=name)
+        ax.plot(
+            one["Period_s"],
+            one["PSA_g"],
+            linewidth=1.4,
+            label=_short_plot_label(name, max_len=28),
+        )
     ax.set_xlabel("Period_s")
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | Node Mean Spectra Overlay")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, ncol=1)
     ax.grid(True, alpha=0.25)
-    fig.tight_layout(rect=(0, 0, 0.8, 1))
-    fig.savefig(out_png, dpi=150)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
     return True
 
@@ -2169,6 +2337,7 @@ def run_structural_moment_export(args, logger=print):
     merge_plate_group2 = bool(
         getattr(args, "plate_group2_merge_single_profile", False)
     )
+    plot_dpi = int(float(getattr(args, "plot_dpi", 150) or 150))
     out_text = str(getattr(args, "out", "")).strip()
     out_path = Path(out_text).expanduser()
     if not str(getattr(args, "password", "")).strip():
@@ -2370,7 +2539,7 @@ def run_structural_moment_export(args, logger=print):
                 ].empty:
                     continue
                 png_path = plot_dir / f"moment_{direction}_{object_group}.png"
-                ok = _plot_moment_group(avg_df, direction, object_group, png_path)
+                ok = _plot_moment_group(avg_df, direction, object_group, png_path, dpi=plot_dpi)
                 if ok:
                     plot_files.append(str(png_path))
                     logger(f"Chart -> {png_path}")
@@ -2416,6 +2585,10 @@ def run_node_multiphase_spectrum_export(args, logger=print):
     selected_ids = list(getattr(args, "curvepoint_id", []) or [])
     out_text = str(getattr(args, "out", "")).strip()
     out_path = Path(out_text).expanduser()
+    plot_dpi = int(float(getattr(args, "plot_dpi", 150) or 150))
+    save_node_timehistory_subfolders = bool(
+        getattr(args, "save_node_timehistory_subfolders", False)
+    )
     if not str(getattr(args, "password", "")).strip():
         raise RuntimeError("Password is required.")
     if not x_phase_names and not y_phase_names:
@@ -2477,6 +2650,8 @@ def run_node_multiphase_spectrum_export(args, logger=print):
 
         time_col = str(getattr(args, "time_col", "DynamicTime")).strip() or "DynamicTime"
         damping = float(args.damping)
+        dt_snap_target = float(getattr(args, "dt_snap_target", 0.01) or 0.0)
+        dt_snap_rel_tol = float(getattr(args, "dt_snap_rel_tol", 0.02) or 0.0)
         curve_time_result_type, curve_time_result_type_path = _resolve_curve_time_result_type(
             g_o,
             acc_result_type_path,
@@ -2486,7 +2661,8 @@ def run_node_multiphase_spectrum_export(args, logger=print):
         total_phase_count = len(x_phase_names) + len(y_phase_names)
         logger(
             f"Node run started: phases={total_phase_count}, "
-            f"curvepoints={len(selected)}, result_type={acc_result_type_path}"
+            f"curvepoints={len(selected)}, result_type={acc_result_type_path}, "
+            f"plot_dpi={plot_dpi}"
         )
         if known_data_from > 0 and mismatched_data_from == known_data_from:
             logger(
@@ -2537,17 +2713,41 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                     continue
 
                 phase_t_values = []
-                for i, st in enumerate(step_list, start=1):
+                for st in step_list:
                     try:
                         phase_t_values.append(float(st.Reached.DynamicTime.value))
                     except Exception:
-                        phase_t_values.append(float(i))
+                        phase_t_values.append(float("nan"))
 
                 phase_dt = None
-                try:
-                    phase_dt = _estimate_dt(np.asarray(phase_t_values, dtype=float))
-                except Exception:
-                    phase_dt = None
+                valid_times = [v for v in phase_t_values if np.isfinite(v)]
+                if len(valid_times) >= 2:
+                    try:
+                        phase_dt = _estimate_dt(np.asarray(valid_times, dtype=float))
+                    except Exception:
+                        phase_dt = None
+                if (phase_dt is None or phase_dt <= 0.0) and len(step_list) >= 2:
+                    try:
+                        t0 = float(step_list[0].Reached.DynamicTime.value)
+                        t1 = float(step_list[-1].Reached.DynamicTime.value)
+                        if np.isfinite(t0) and np.isfinite(t1) and t1 > t0:
+                            phase_dt = float((t1 - t0) / (len(step_list) - 1))
+                    except Exception:
+                        pass
+
+                if phase_dt is not None and phase_dt > 0.0:
+                    base_start = 0.0
+                    for value in phase_t_values:
+                        if np.isfinite(value):
+                            base_start = float(value)
+                            break
+                    arr = np.asarray(phase_t_values, dtype=float)
+                    if (not np.all(np.isfinite(arr))) or np.any(np.diff(arr) <= 0.0):
+                        phase_t_values = [
+                            float(base_start + phase_dt * idx) for idx in range(len(step_list))
+                        ]
+                else:
+                    phase_t_values = [float(i) for i in range(1, len(step_list) + 1)]
 
                 start_step = step_list[0]
                 end_step = step_list[-1]
@@ -2588,22 +2788,25 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                         if time_vals is None:
                             if step_count >= n and step_count > 0:
                                 time_vals = phase_t_values[:n]
-                            else:
-                                dt_fallback = phase_dt if (phase_dt is not None and phase_dt > 0.0) else 1.0
+                            elif phase_dt is not None and phase_dt > 0.0:
                                 start_t = phase_t_values[0] if phase_t_values else 0.0
-                                time_vals = [start_t + dt_fallback * i for i in range(n)]
+                                time_vals = [start_t + phase_dt * i for i in range(n)]
+                            else:
+                                time_vals = [float(i) for i in range(1, n + 1)]
 
                         dt = None
-                        used_unit_time_fallback = False
                         try:
                             dt = _estimate_dt(np.asarray(time_vals, dtype=float))
                         except Exception:
                             if phase_dt is not None and phase_dt > 0.0:
                                 dt = phase_dt
-                        if (dt is None or dt <= 0.0) and n >= 2:
-                            time_vals = [float(i) for i in range(n)]
-                            dt = 1.0
-                            used_unit_time_fallback = True
+                        snapped_dt = _snap_dt(dt, target=dt_snap_target, rel_tol=dt_snap_rel_tol)
+                        if snapped_dt != dt:
+                            logger(
+                                f"{direction} {resolved_phase_name} | {series} "
+                                f"dt snapped: {dt:.8g} -> {snapped_dt:.8g}"
+                            )
+                            dt = snapped_dt
 
                         for idx, (t_val, a_val) in enumerate(zip(time_vals, acc_vals), start=1):
                             time_rows.append(
@@ -2636,21 +2839,6 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                                 f"{series} ({rec_idx}/{len(selected)}) -> WARN: no spectrum (n={n}, dt={dt})"
                             )
                             continue
-                        if used_unit_time_fallback:
-                            status_rows.append(
-                                {
-                                    "Category": "NodeRead",
-                                    "Direction": direction,
-                                    "Phase": resolved_phase_name,
-                                    "Series": series,
-                                    "CurvePointId": cp_id,
-                                    "Status": "WARN",
-                                    "Message": (
-                                        "Dynamic time unavailable/constant; "
-                                        "spectrum used unit time step dt=1.0."
-                                    ),
-                                }
-                            )
 
                         psa = _compute_psa_spectrum(np.asarray(acc_vals, dtype=float), dt, periods, damping)
                         for period_s, psa_val in zip(periods, psa):
@@ -2780,20 +2968,64 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                 one_mean = dir_mean[dir_mean["Series"] == series].copy()
 
                 png_time = plot_dir / f"node_time_{direction}_{safe_label(series)}.png"
-                if _plot_node_timehistory(direction, series, one_time, png_time, time_col):
+                if _plot_node_timehistory(
+                    direction,
+                    series,
+                    one_time,
+                    png_time,
+                    time_col,
+                    dpi=plot_dpi,
+                ):
                     chart_paths.append(str(png_time))
 
                 png_spec = plot_dir / f"node_spectrum_{direction}_{safe_label(series)}.png"
-                if _plot_node_spectrum_single(direction, series, one_spec, one_mean, png_spec):
+                if _plot_node_spectrum_single(
+                    direction,
+                    series,
+                    one_spec,
+                    one_mean,
+                    png_spec,
+                    dpi=plot_dpi,
+                ):
                     chart_paths.append(str(png_spec))
 
             png_group_phase = plot_dir / f"node_group_phase_{direction}.png"
-            if _plot_node_spectrum_group_phase(direction, spectrum_long_df, png_group_phase):
+            if _plot_node_spectrum_group_phase(
+                direction,
+                spectrum_long_df,
+                png_group_phase,
+                dpi=plot_dpi,
+            ):
                 chart_paths.append(str(png_group_phase))
 
             png_group_mean = plot_dir / f"node_group_mean_{direction}.png"
-            if _plot_node_spectrum_group_mean(direction, spectrum_mean_df, png_group_mean):
+            if _plot_node_spectrum_group_mean(
+                direction,
+                spectrum_mean_df,
+                png_group_mean,
+                dpi=plot_dpi,
+            ):
                 chart_paths.append(str(png_group_mean))
+
+        if save_node_timehistory_subfolders:
+            written_histories = _export_node_timehistory_subfolders(
+                time_df,
+                out_path,
+                time_col,
+                logger=logger,
+            )
+            for path_text in written_histories:
+                status_rows.append(
+                    {
+                        "Category": "TimeHistoryFile",
+                        "Direction": "",
+                        "Phase": "",
+                        "Series": "",
+                        "CurvePointId": "",
+                        "Status": "OK",
+                        "Message": path_text,
+                    }
+                )
 
         for path_text in chart_paths:
             logger(f"Chart -> {path_text}")

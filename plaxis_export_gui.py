@@ -134,6 +134,8 @@ class PlaxisExportApp(tk.Tk):
         self.hist_period_start = tk.StringVar(value="0.01")
         self.hist_period_end = tk.StringVar(value="3.00")
         self.hist_period_step = tk.StringVar(value="0.01")
+        self.hist_plot_dpi = tk.StringVar(value="180")
+        self.hist_save_phase_timehistory = tk.BooleanVar(value=False)
         self.plate_group1_merge_single = tk.BooleanVar(value=False)
         self.plate_group2_merge_single = tk.BooleanVar(value=False)
 
@@ -187,6 +189,14 @@ class PlaxisExportApp(tk.Tk):
         self._add_labeled_entry(analysis, 3, "Period start (s):", self.hist_period_start)
         self._add_labeled_entry(analysis, 4, "Period end (s):", self.hist_period_end)
         self._add_labeled_entry(analysis, 5, "Period step (s):", self.hist_period_step)
+        self._add_labeled_entry(analysis, 6, "PNG DPI:", self.hist_plot_dpi)
+        save_hist_chk = ttk.Checkbutton(
+            analysis,
+            text="Save node time histories into phase subfolders",
+            variable=self.hist_save_phase_timehistory,
+        )
+        save_hist_chk.grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+        self.busy_widgets.append(save_hist_chk)
 
         phase_box = ttk.LabelFrame(inner, text="Phase Selection (Regex + Manual)")
         phase_box.pack(fill="both", padx=8, pady=(0, 8))
@@ -721,6 +731,30 @@ class PlaxisExportApp(tk.Tk):
             if name:
                 out.append(name)
         return out
+
+    def _phase_direction_warnings(self, x_phase_names, y_phase_names):
+        warnings = []
+        x_regex = self.phase_regex_x.get().strip()
+        y_regex = self.phase_regex_y.get().strip()
+        try:
+            rx = re.compile(x_regex) if x_regex else None
+        except re.error:
+            rx = None
+        try:
+            ry = re.compile(y_regex) if y_regex else None
+        except re.error:
+            ry = None
+
+        if rx and x_phase_names and all(not rx.search(name) for name in x_phase_names):
+            warnings.append(
+                "Warning: selected X phases do not match X regex. Check X list selection."
+            )
+        if ry and y_phase_names and all(not ry.search(name) for name in y_phase_names):
+            warnings.append(
+                "Warning: selected Y phases do not match Y regex. Check Y list selection."
+            )
+        return warnings
+
     def run_structural_moment_export(self):
         def task():
             if not self.hist_password.get().strip():
@@ -730,6 +764,8 @@ class PlaxisExportApp(tk.Tk):
             y_phase_names = self._selected_phase_names(self.y_phase_list)
             if not x_phase_names and not y_phase_names:
                 raise RuntimeError("Select at least one X or Y phase.")
+            for msg in self._phase_direction_warnings(x_phase_names, y_phase_names):
+                self._log_async(msg)
 
             pile_names = self._selected_object_names(self.pile_list, self.pile_label_to_name)
             plate_g1_names = self._selected_object_names(
@@ -761,6 +797,7 @@ class PlaxisExportApp(tk.Tk):
                     plate_group2_merge_single_profile=bool(
                         self.plate_group2_merge_single.get()
                     ),
+                    plot_dpi=int(float(self.hist_plot_dpi.get().strip())),
                     out=self.hist_out_struct.get().strip(),
                 )
                 try:
@@ -794,6 +831,8 @@ class PlaxisExportApp(tk.Tk):
             y_phase_names = self._selected_phase_names(self.y_phase_list)
             if not x_phase_names and not y_phase_names:
                 raise RuntimeError("Select at least one X or Y phase.")
+            for msg in self._phase_direction_warnings(x_phase_names, y_phase_names):
+                self._log_async(msg)
 
             selected_indices = self.api_nodes_list.curselection()
             selected_labels = [self.api_nodes_list.get(i) for i in selected_indices]
@@ -821,6 +860,10 @@ class PlaxisExportApp(tk.Tk):
                     period_start=float(self.hist_period_start.get().strip()),
                     period_end=float(self.hist_period_end.get().strip()),
                     period_step=float(self.hist_period_step.get().strip()),
+                    plot_dpi=int(float(self.hist_plot_dpi.get().strip())),
+                    save_node_timehistory_subfolders=bool(
+                        self.hist_save_phase_timehistory.get()
+                    ),
                     out=self.hist_out_node.get().strip(),
                 )
                 try:
