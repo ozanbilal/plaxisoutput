@@ -21,7 +21,16 @@ class PlaxisExportApp(tk.Tk):
         self.pile_label_to_name = {}
         self.plate_label_to_name = {}
         self.api_curvepoint_ids = {}
+        self._setup_styles()
         self._build_ui()
+
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        try:
+            style.configure("Vertical.TScrollbar", arrowsize=18, width=18)
+            style.configure("Horizontal.TScrollbar", arrowsize=18, width=18)
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = ttk.Frame(self)
@@ -30,16 +39,11 @@ class PlaxisExportApp(tk.Tk):
         root.columnconfigure(1, weight=2)
         root.rowconfigure(0, weight=1)
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-
-        spectrum_tab = ttk.Frame(self.notebook)
-        multiphase_tab = ttk.Frame(self.notebook)
-        self.notebook.add(spectrum_tab, text="Spectrum (Points GUI)")
-        self.notebook.add(multiphase_tab, text="Multi-phase API")
-
-        self._build_spectrum_tab(spectrum_tab)
-        self._build_multiphase_tab(multiphase_tab)
+        left = ttk.Frame(root)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        self._build_multiphase_tab(left)
 
         side = ttk.Frame(root)
         side.grid(row=0, column=1, sticky="nsew")
@@ -51,8 +55,10 @@ class PlaxisExportApp(tk.Tk):
         self.run_active_btn = ttk.Button(quick)
         self.run_active_btn.pack(fill="x", padx=6, pady=6)
         self.busy_widgets.append(self.run_active_btn)
-        self._update_quick_action_button()
-        self.notebook.bind("<<NotebookTabChanged>>", self._update_quick_action_button)
+        self.run_active_btn.configure(
+            text="Run Node Spectrum Analysis",
+            command=self.run_node_multiphase_export,
+        )
 
         log_frame = ttk.LabelFrame(side, text="Log")
         log_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -62,60 +68,6 @@ class PlaxisExportApp(tk.Tk):
         self.log_box.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.log_box.configure(state="disabled")
 
-    def _build_spectrum_tab(self, parent):
-        self.spec_out = tk.StringVar(
-            value=r"C:\Users\PC\OneDrive\Desktop\PLAXIS_spectrum_from_points.xlsx"
-        )
-        self.spec_output_title = tk.StringVar(value=r".*PLAXIS 2D Ultimate Output.*")
-        self.spec_points_title = tk.StringVar(
-            value=r".*(Points|Curve points|Curves manager|Select points).*"
-        )
-        self.spec_combo_index = tk.StringVar(value="0")
-        self.spec_copy_button = tk.StringVar(value="Copy")
-        self.spec_x_col = tk.StringVar(value="Period_s")
-        self.spec_y_col = tk.StringVar(value="PSA_g")
-        self.spec_wait = tk.StringVar(value="0.25")
-
-        config = ttk.LabelFrame(parent, text="Window / Export Settings")
-        config.pack(fill="x", padx=8, pady=8)
-        config.columnconfigure(1, weight=1)
-
-        self._add_labeled_entry(config, 0, "Output:", self.spec_out)
-        browse_out = ttk.Button(
-            config,
-            text="Browse",
-            command=lambda: self._pick_file(self.spec_out, save=True),
-        )
-        browse_out.grid(row=0, column=2, padx=6, pady=4, sticky="w")
-        self.busy_widgets.append(browse_out)
-
-        self._add_labeled_entry(config, 1, "Output title regex:", self.spec_output_title)
-        self._add_labeled_entry(config, 2, "Points title regex:", self.spec_points_title)
-        self._add_labeled_entry(config, 3, "Combo index:", self.spec_combo_index)
-        self._add_labeled_entry(config, 4, "Copy button text:", self.spec_copy_button)
-        self._add_labeled_entry(config, 5, "X column:", self.spec_x_col)
-        self._add_labeled_entry(config, 6, "Y column:", self.spec_y_col)
-        self._add_labeled_entry(config, 7, "Action wait (sec):", self.spec_wait)
-
-        nodes_box = ttk.LabelFrame(parent, text="Nodes from Points Combobox")
-        nodes_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        nodes_box.columnconfigure(0, weight=1)
-        nodes_box.rowconfigure(1, weight=1)
-
-        actions = ttk.Frame(nodes_box)
-        actions.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        load_btn = ttk.Button(actions, text="Load Nodes", command=self.load_nodes)
-        load_btn.pack(side="left", padx=(0, 6))
-        sel_all_btn = ttk.Button(actions, text="Select All", command=self.select_all_nodes)
-        sel_all_btn.pack(side="left", padx=(0, 6))
-        clear_btn = ttk.Button(actions, text="Clear", command=self.clear_nodes_selection)
-        clear_btn.pack(side="left")
-        self.busy_widgets.extend([load_btn, sel_all_btn, clear_btn])
-
-        self.nodes_list = tk.Listbox(nodes_box, selectmode="extended")
-        self.nodes_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self._style_listbox(self.nodes_list)
-        self.busy_widgets.append(self.nodes_list)
     def _build_multiphase_tab(self, parent):
         self.hist_host = tk.StringVar(value="localhost")
         self.hist_port = tk.StringVar(value="10000")
@@ -140,9 +92,17 @@ class PlaxisExportApp(tk.Tk):
         self.plate_group2_merge_single = tk.BooleanVar(value=False)
 
         canvas = tk.Canvas(parent, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll = tk.Scrollbar(
+            parent,
+            orient="vertical",
+            command=canvas.yview,
+            width=24,
+            activebackground="#9A9A9A",
+            bg="#CFCFCF",
+            troughcolor="#F2F2F2",
+        )
         scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
         canvas.configure(yscrollcommand=scroll.set)
         inner = ttk.Frame(canvas)
         window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -243,9 +203,11 @@ class PlaxisExportApp(tk.Tk):
         self.x_phase_list = tk.Listbox(x_frame, selectmode="extended", height=7)
         self.x_phase_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.x_phase_list)
+        self._attach_vertical_scrollbar(x_frame, self.x_phase_list, row=1, column=1)
         self.y_phase_list = tk.Listbox(y_frame, selectmode="extended", height=7)
         self.y_phase_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.y_phase_list)
+        self._attach_vertical_scrollbar(y_frame, self.y_phase_list, row=1, column=1)
         self.busy_widgets.extend(
             [x_sel_all, x_clear, y_sel_all, y_clear, self.x_phase_list, self.y_phase_list]
         )
@@ -272,6 +234,7 @@ class PlaxisExportApp(tk.Tk):
 
         for frame in (pile_frame, p1_frame, p2_frame):
             frame.columnconfigure(0, weight=1)
+            frame.columnconfigure(1, weight=0)
             frame.rowconfigure(1, weight=1)
 
         pile_actions = ttk.Frame(pile_frame)
@@ -326,12 +289,15 @@ class PlaxisExportApp(tk.Tk):
         self.pile_list = tk.Listbox(pile_frame, selectmode="extended", height=7)
         self.pile_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.pile_list)
+        self._attach_vertical_scrollbar(pile_frame, self.pile_list, row=1, column=1)
         self.plate_group1_list = tk.Listbox(p1_frame, selectmode="extended", height=7)
         self.plate_group1_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.plate_group1_list)
+        self._attach_vertical_scrollbar(p1_frame, self.plate_group1_list, row=1, column=1)
         self.plate_group2_list = tk.Listbox(p2_frame, selectmode="extended", height=7)
         self.plate_group2_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.plate_group2_list)
+        self._attach_vertical_scrollbar(p2_frame, self.plate_group2_list, row=1, column=1)
         self.busy_widgets.extend(
             [
                 pile_sel_all,
@@ -351,6 +317,7 @@ class PlaxisExportApp(tk.Tk):
         nodes = ttk.LabelFrame(inner, text="CurvePoints (for Node Spectrum Analysis)")
         nodes.pack(fill="both", padx=8, pady=(0, 8))
         nodes.columnconfigure(0, weight=1)
+        nodes.columnconfigure(1, weight=0)
         nodes.rowconfigure(1, weight=1)
 
         node_actions = ttk.Frame(nodes)
@@ -372,6 +339,7 @@ class PlaxisExportApp(tk.Tk):
         self.api_nodes_list = tk.Listbox(nodes, selectmode="extended", height=8)
         self.api_nodes_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.api_nodes_list)
+        self._attach_vertical_scrollbar(nodes, self.api_nodes_list, row=1, column=1)
         self.busy_widgets.append(self.api_nodes_list)
 
         run_frame = ttk.LabelFrame(inner, text="Run")
@@ -420,6 +388,13 @@ class PlaxisExportApp(tk.Tk):
             activestyle="none",
         )
 
+    def _attach_vertical_scrollbar(self, parent, listbox, row, column):
+        scroll = tk.Scrollbar(parent, orient="vertical", command=listbox.yview, width=16)
+        scroll.grid(row=row, column=column, sticky="ns", pady=(0, 6), padx=(0, 6))
+        listbox.configure(yscrollcommand=scroll.set)
+        self.busy_widgets.append(scroll)
+        return scroll
+
     def _set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
@@ -458,19 +433,6 @@ class PlaxisExportApp(tk.Tk):
 
     def _log_async(self, message):
         self.after(0, lambda m=message: self.log(m))
-
-    def _update_quick_action_button(self, _event=None):
-        tab_text = self.notebook.tab(self.notebook.select(), "text")
-        if tab_text == "Spectrum (Points GUI)":
-            self.run_active_btn.configure(
-                text="Run Spectrum Export (Points GUI)",
-                command=self.run_spectrum_export,
-            )
-        else:
-            self.run_active_btn.configure(
-                text="Run Node Spectrum Analysis",
-                command=self.run_node_multiphase_export,
-            )
 
     def _candidate_ports(self):
         ports = []
@@ -528,53 +490,6 @@ class PlaxisExportApp(tk.Tk):
 
     def _clear_listbox(self, lb):
         lb.selection_clear(0, "end")
-    def load_nodes(self):
-        def task():
-            combo_idx = int(self.spec_combo_index.get().strip())
-            nodes = core.list_points_nodes(
-                self.spec_output_title.get().strip(),
-                self.spec_points_title.get().strip(),
-                combo_idx,
-            )
-
-            def ui_update():
-                self.nodes_list.delete(0, "end")
-                for node in nodes:
-                    self.nodes_list.insert("end", node)
-                self.log(f"Loaded {len(nodes)} nodes.")
-
-            self.after(0, ui_update)
-
-        self._run_background(task)
-
-    def select_all_nodes(self):
-        self.nodes_list.selection_set(0, "end")
-        self.log("All nodes selected.")
-
-    def clear_nodes_selection(self):
-        self.nodes_list.selection_clear(0, "end")
-        self.log("Node selection cleared.")
-
-    def run_spectrum_export(self):
-        def task():
-            selected_indices = self.nodes_list.curselection()
-            selected_nodes = [self.nodes_list.get(i) for i in selected_indices]
-            args = SimpleNamespace(
-                out=self.spec_out.get().strip(),
-                output_window_title=self.spec_output_title.get().strip(),
-                points_window_title=self.spec_points_title.get().strip(),
-                combo_index=int(self.spec_combo_index.get().strip()),
-                copy_button=self.spec_copy_button.get().strip(),
-                x_col=self.spec_x_col.get().strip(),
-                y_col=self.spec_y_col.get().strip(),
-                wait=float(self.spec_wait.get().strip()),
-                node=selected_nodes,
-            )
-            mode_text = "selected nodes" if selected_nodes else "all nodes"
-            self.log(f"Spectrum export started ({mode_text}).")
-            core.run_spectrum_gui(args, logger=lambda msg: self.after(0, lambda m=msg: self.log(m)))
-
-        self._run_background(task)
 
     def load_phases(self):
         def task():
