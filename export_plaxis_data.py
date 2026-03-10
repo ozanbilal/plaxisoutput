@@ -1697,6 +1697,12 @@ def _ensure_timehistory_dir(base_out_path):
     return hist_dir
 
 
+def _derive_output_with_suffix(base_out_path, suffix):
+    out_path = Path(base_out_path)
+    stemmed = out_path.with_suffix("")
+    return stemmed.parent / f"{stemmed.name}_{suffix}.xlsx"
+
+
 def _write_multisheet_workbook(out_path, sheets, logger=print):
     writer, out_final = _open_excel_writer_with_fallback(Path(out_path), logger=logger)
     with writer:
@@ -1728,14 +1734,26 @@ def _export_node_timehistory_subfolders(time_df, base_out_path, time_col, logger
         if one.empty:
             continue
         one = one.sort_values(time_col).reset_index(drop=True)
-        phase_dir = root_dir / _safe_fs_name(_phase_base_name(phase_name))
-        phase_dir.mkdir(parents=True, exist_ok=True)
-        file_name = f"{_safe_fs_name(series_name)}.csv"
-        csv_path = phase_dir / file_name
-        one[["Step", time_col, "Acceleration"]].to_csv(csv_path, index=False)
-        written_paths.append(str(csv_path))
+        phase_base = _safe_fs_name(_phase_base_name(phase_name))
+        node_number = (
+            _node_number(node_name)
+            or _node_number(series_name)
+            or _node_number(str(curvepoint_id))
+        )
+        if node_number:
+            node_token = f"Node{node_number}"
+        else:
+            raw_node = str(node_name or series_name or curvepoint_id or "Node").strip()
+            node_token = _safe_fs_name(raw_node.replace(" ", ""))
+
+        node_dir = root_dir / node_token
+        node_dir.mkdir(parents=True, exist_ok=True)
+        txt_path = node_dir / f"{phase_base}.txt"
+        export_df = one[[time_col, "Acceleration"]].copy()
+        export_df.to_csv(txt_path, index=False, sep="\t")
+        written_paths.append(str(txt_path))
         if logger is not None:
-            logger(f"TimeHistory -> {csv_path}")
+            logger(f"TimeHistory -> {txt_path}")
     return written_paths
 
 
@@ -1852,6 +1870,69 @@ def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
                     "y_axis_title": "PSA_g",
                     "chart_type": "scatter",
                     "shared_x_col": 1,
+                }
+            )
+
+    return specs
+
+
+def _build_stress_strain_wide_specs(stress_strain_df):
+    if stress_strain_df.empty:
+        return []
+
+    used_names = set(
+        [
+            sanitize_sheet_name("Phases"),
+            sanitize_sheet_name("Selections"),
+            sanitize_sheet_name("StressStrainLong"),
+            sanitize_sheet_name("_Status"),
+        ]
+    )
+    specs = []
+    directions = sorted(stress_strain_df["Direction"].dropna().unique().tolist())
+    for direction in directions:
+        dir_df = stress_strain_df[stress_strain_df["Direction"] == direction].copy()
+        series_list = sorted(dir_df["Series"].dropna().unique().tolist())
+        for series in series_list:
+            sub = dir_df[dir_df["Series"] == series].copy()
+            if sub.empty:
+                continue
+
+            frames = []
+            series_pairs = []
+            col_cursor = 1
+            for phase_name in sorted(sub["Phase"].dropna().unique().tolist()):
+                one = (
+                    sub[sub["Phase"] == phase_name][["Gamma_xy", "Tau_xy"]]
+                    .dropna(subset=["Gamma_xy", "Tau_xy"], how="any")
+                    .reset_index(drop=True)
+                )
+                if one.empty:
+                    continue
+                phase_base = _phase_base_name(phase_name)
+                x_col = f"{phase_base}_GammaXY"
+                y_col = f"{phase_base}_TauXY"
+                one = one.rename(columns={"Gamma_xy": x_col, "Tau_xy": y_col})
+                frames.append(one[[x_col, y_col]])
+                series_pairs.append({"x_col": col_cursor, "y_col": col_cursor + 1, "title": phase_base})
+                col_cursor += 2
+
+            if not frames:
+                continue
+
+            wide = pd.concat(frames, axis=1)
+            sheet_name = _unique_sheet_name(f"TauGam_{direction}_{safe_label(series)}", used_names)
+            specs.append(
+                {
+                    "sheet_name": sheet_name,
+                    "frame": wide,
+                    "chart_title": f"{direction} | {series} | Tauxy-Gamxy",
+                    "x_axis_title": "Gamma_xy",
+                    "y_axis_title": "Tau_xy",
+                    "chart_type": "scatter",
+                    "series_pairs": series_pairs,
+                    "chart_width": 18.0,
+                    "chart_height": 8.5,
                 }
             )
 
@@ -2088,6 +2169,16 @@ def _apply_compact_legend(fig, ax):
     fig.tight_layout(rect=(0, 0, 0.82, 1))
 
 
+def _anchor_axes_at_zero(ax, zero_x=False, zero_y=False):
+    ax.margins(x=0.0, y=0.0)
+    if zero_x:
+        right = ax.get_xlim()[1]
+        ax.set_xlim(left=0.0, right=max(0.0, right))
+    if zero_y:
+        top = ax.get_ylim()[1]
+        ax.set_ylim(bottom=0.0, top=max(0.0, top))
+
+
 def _plot_moment_group(avg_df, direction, object_group, out_png, dpi=150):
     subset = avg_df[
         (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
@@ -2145,6 +2236,7 @@ def _plot_node_timehistory(direction, series_name, frame, out_png, time_col, dpi
     ax.set_ylabel("Acceleration")
     ax.set_title(f"{direction} | {series_name} | Acceleration-Time")
     ax.grid(True, alpha=0.25)
+    _anchor_axes_at_zero(ax, zero_x=True, zero_y=False)
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
@@ -2180,6 +2272,7 @@ def _plot_node_spectrum_single(direction, series_name, long_df, mean_df, out_png
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | {series_name} | Spectrum")
     ax.grid(True, alpha=0.25)
+    _anchor_axes_at_zero(ax, zero_x=True, zero_y=True)
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
@@ -2205,6 +2298,7 @@ def _plot_node_spectrum_group_phase(direction, long_df, out_png, dpi=150):
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | All Node Spectra (Phase-Based Overlay)")
     ax.grid(True, alpha=0.25)
+    _anchor_axes_at_zero(ax, zero_x=True, zero_y=True)
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
@@ -2230,6 +2324,270 @@ def _plot_node_spectrum_group_mean(direction, mean_df, out_png, dpi=150):
     ax.set_ylabel("PSA_g")
     ax.set_title(f"{direction} | Node Mean Spectra Overlay")
     ax.grid(True, alpha=0.25)
+    _anchor_axes_at_zero(ax, zero_x=True, zero_y=True)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
+    plt.close(fig)
+    return True
+
+
+def _plot_stress_strain_single(direction, series_name, frame, out_png, dpi=150):
+    if frame.empty:
+        return False
+    plt = _mpl_pyplot()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for phase_name in sorted(frame["Phase"].dropna().unique().tolist()):
+        one = (
+            frame[frame["Phase"] == phase_name][["Gamma_xy", "Tau_xy"]]
+            .dropna(subset=["Gamma_xy", "Tau_xy"], how="any")
+            .reset_index(drop=True)
+        )
+        if one.empty:
+            continue
+        ax.plot(
+            one["Gamma_xy"],
+            one["Tau_xy"],
+            linewidth=1.0,
+            alpha=0.85,
+            label=_short_plot_label(_phase_base_name(phase_name), max_len=36),
+        )
+    ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
+    ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.4)
+    ax.set_xlabel("Gamma_xy")
+    ax.set_ylabel("Tau_xy")
+    ax.set_title(f"{direction} | {series_name} | Tauxy-Gamxy")
+    ax.grid(True, alpha=0.25)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
+    plt.close(fig)
+    return True
+
+
+def _collect_model_node_cloud(g_o, max_points=25000):
+    points = []
+    try:
+        model_nodes = list(g_o.Nodes)
+    except Exception:
+        return points
+
+    for node in model_nodes:
+        try:
+            x, y = xy_of(node)
+        except Exception:
+            continue
+        if np.isfinite(x) and np.isfinite(y):
+            points.append((float(x), float(y)))
+
+    if not points:
+        return points
+
+    max_points = int(max_points or 0)
+    if max_points > 0 and len(points) > max_points:
+        step = max(1, int(math.ceil(len(points) / float(max_points))))
+        points = points[::step]
+    return points
+
+
+def _build_node_export_context(g_o, selected_ids, primary_result_type_path):
+    all_records = []
+    for idx, cp in enumerate(list(g_o.CurvePoints), start=1):
+        all_records.append(_read_curvepoint_metadata(cp, idx))
+    if not all_records:
+        raise RuntimeError("No CurvePoints found. Save desired nodes to curve points first.")
+
+    selected = _resolve_selected_curvepoints(all_records, selected_ids)
+    model_node_cloud = _collect_model_node_cloud(g_o)
+    result_prefix = str(primary_result_type_path).split(".", 1)[0].strip().lower()
+    known_data_from = 0
+    mismatched_data_from = 0
+    for rec in selected:
+        data_from_text = str(rec.get("data_from") or "").strip()
+        if not data_from_text:
+            continue
+        known_data_from += 1
+        if not data_from_text.lower().startswith(result_prefix):
+            mismatched_data_from += 1
+
+    base_labels = [rec["label"] for rec in selected]
+    series_names = _make_unique_labels(base_labels)
+    series_by_id = {rec["id"]: name for rec, name in zip(selected, series_names)}
+
+    selection_rows = []
+    node_map_rows = []
+    for rec in selected:
+        selection_rows.append(
+            {
+                "SelectionType": "CurvePoint",
+                "ObjectType": "Node",
+                "ObjectName": rec["name"],
+                "CurvePointId": rec["id"],
+                "Series": series_by_id.get(rec["id"], rec["name"]),
+                "NodeName": rec["node_name"],
+                "X": rec["x"],
+                "Y": rec["y"],
+            }
+        )
+        node_map_rows.append(
+            {
+                "CurvePointId": rec["id"],
+                "Series": series_by_id.get(rec["id"], rec["name"]),
+                "CurvePointName": rec["name"],
+                "NodeName": rec["node_name"],
+                "X": rec["x"],
+                "Y": rec["y"],
+                "DataFrom": rec["data_from"],
+            }
+        )
+
+    return {
+        "all_records": all_records,
+        "selected": selected,
+        "model_node_cloud": model_node_cloud,
+        "result_prefix": result_prefix,
+        "known_data_from": known_data_from,
+        "mismatched_data_from": mismatched_data_from,
+        "series_by_id": series_by_id,
+        "selection_rows": selection_rows,
+        "node_map_rows": node_map_rows,
+        "phase_map": _build_phase_alias_map(list(g_o.Phases)),
+    }
+
+
+def _resolve_phase_time_series(step_list):
+    phase_t_values = []
+    for st in step_list:
+        try:
+            phase_t_values.append(float(st.Reached.DynamicTime.value))
+        except Exception:
+            phase_t_values.append(float("nan"))
+
+    phase_dt = None
+    valid_times = [v for v in phase_t_values if np.isfinite(v)]
+    if len(valid_times) >= 2:
+        try:
+            phase_dt = _estimate_dt(np.asarray(valid_times, dtype=float))
+        except Exception:
+            phase_dt = None
+    if (phase_dt is None or phase_dt <= 0.0) and len(step_list) >= 2:
+        try:
+            t0 = float(step_list[0].Reached.DynamicTime.value)
+            t1 = float(step_list[-1].Reached.DynamicTime.value)
+            if np.isfinite(t0) and np.isfinite(t1) and t1 > t0:
+                phase_dt = float((t1 - t0) / (len(step_list) - 1))
+        except Exception:
+            pass
+
+    if phase_dt is not None and phase_dt > 0.0:
+        base_start = 0.0
+        for value in phase_t_values:
+            if np.isfinite(value):
+                base_start = float(value)
+                break
+        arr = np.asarray(phase_t_values, dtype=float)
+        if (not np.all(np.isfinite(arr))) or np.any(np.diff(arr) <= 0.0):
+            phase_t_values = [float(base_start + phase_dt * idx) for idx in range(len(step_list))]
+    else:
+        phase_t_values = [float(i) for i in range(1, len(step_list) + 1)]
+
+    return phase_t_values, phase_dt
+
+
+def _read_curve_time_values(
+    g_o,
+    curve_obj,
+    start_step,
+    end_step,
+    curve_time_result_type,
+    count,
+    step_count,
+    phase_t_values,
+    phase_dt,
+):
+    time_vals = None
+    if curve_time_result_type is not None:
+        try:
+            raw_t = list(
+                g_o.getcurveresultspath(
+                    [curve_obj],
+                    start_step,
+                    end_step,
+                    curve_time_result_type,
+                )
+            )
+            t_vals = _safe_float_list(raw_t)
+            if len(t_vals) == count:
+                time_vals = t_vals
+        except Exception:
+            time_vals = None
+
+    if time_vals is None:
+        if step_count >= count and step_count > 0:
+            time_vals = phase_t_values[:count]
+        elif phase_dt is not None and phase_dt > 0.0:
+            start_t = phase_t_values[0] if phase_t_values else 0.0
+            time_vals = [start_t + phase_dt * i for i in range(count)]
+        else:
+            time_vals = [float(i) for i in range(1, count + 1)]
+    return time_vals
+
+
+def _plot_node_selection_map(model_points, node_map_df, out_png, dpi=150):
+    if node_map_df.empty:
+        return False
+
+    sel = node_map_df.copy()
+    sel["X"] = pd.to_numeric(sel["X"], errors="coerce")
+    sel["Y"] = pd.to_numeric(sel["Y"], errors="coerce")
+    sel = sel[np.isfinite(sel["X"]) & np.isfinite(sel["Y"])].copy()
+    if sel.empty:
+        return False
+
+    plt = _mpl_pyplot()
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    if model_points:
+        bg_x, bg_y = zip(*model_points)
+        ax.scatter(
+            bg_x,
+            bg_y,
+            s=5,
+            c="#B8BEC7",
+            alpha=0.35,
+            edgecolors="none",
+            rasterized=True,
+            label="PLAXIS model nodes",
+        )
+
+    ax.scatter(
+        sel["X"],
+        sel["Y"],
+        s=52,
+        c="#D62728",
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=3,
+        label="Selected",
+    )
+
+    for row in sel.itertuples(index=False):
+        label = str(getattr(row, "Series", "") or getattr(row, "NodeName", "") or "").strip()
+        if not label:
+            label = str(getattr(row, "CurvePointId", "")).strip()
+        label = _short_plot_label(label, max_len=28)
+        ax.annotate(
+            label,
+            (row.X, row.Y),
+            xytext=(6, 6),
+            textcoords="offset points",
+            fontsize=8,
+            zorder=4,
+        )
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_title("Selected CurvePoints | Model XY View")
+    ax.grid(True, alpha=0.25)
+    ax.set_aspect("equal", adjustable="box")
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
     plt.close(fig)
@@ -2606,47 +2964,16 @@ def run_node_multiphase_spectrum_export(args, logger=print):
         acc_result_type = resolve_result_type(g_o, acc_result_type_path)
         periods = _prepare_periods(args.period_start, args.period_end, args.period_step)
 
-        all_records = []
-        for idx, cp in enumerate(list(g_o.CurvePoints), start=1):
-            all_records.append(_read_curvepoint_metadata(cp, idx))
-        if not all_records:
-            raise RuntimeError("No CurvePoints found. Save desired nodes to curve points first.")
-        selected = _resolve_selected_curvepoints(all_records, selected_ids)
-        result_prefix = str(acc_result_type_path).split(".", 1)[0].strip().lower()
-        known_data_from = 0
-        mismatched_data_from = 0
-        for rec in selected:
-            data_from_text = str(rec.get("data_from") or "").strip()
-            if not data_from_text:
-                continue
-            known_data_from += 1
-            if not data_from_text.lower().startswith(result_prefix):
-                mismatched_data_from += 1
-
-        base_labels = [rec["label"] for rec in selected]
-        series_names = _make_unique_labels(base_labels)
-        series_by_id = {rec["id"]: name for rec, name in zip(selected, series_names)}
-
-        phase_map = _build_phase_alias_map(list(g_o.Phases))
+        ctx = _build_node_export_context(g_o, selected_ids, acc_result_type_path)
+        selected = ctx["selected"]
+        series_by_id = ctx["series_by_id"]
+        phase_map = ctx["phase_map"]
         phases_rows = []
-        selection_rows = []
+        selection_rows = list(ctx["selection_rows"])
+        node_map_rows = list(ctx["node_map_rows"])
         status_rows = []
         time_rows = []
         spectrum_rows = []
-
-        for rec in selected:
-            selection_rows.append(
-                {
-                    "SelectionType": "CurvePoint",
-                    "ObjectType": "Node",
-                    "ObjectName": rec["name"],
-                    "CurvePointId": rec["id"],
-                    "Series": series_by_id.get(rec["id"], rec["name"]),
-                    "NodeName": rec["node_name"],
-                    "X": rec["x"],
-                    "Y": rec["y"],
-                }
-            )
 
         time_col = str(getattr(args, "time_col", "DynamicTime")).strip() or "DynamicTime"
         damping = float(args.damping)
@@ -2660,19 +2987,20 @@ def run_node_multiphase_spectrum_export(args, logger=print):
 
         total_phase_count = len(x_phase_names) + len(y_phase_names)
         logger(
-            f"Node run started: phases={total_phase_count}, "
+            f"Node spectrum run started: phases={total_phase_count}, "
             f"curvepoints={len(selected)}, result_type={acc_result_type_path}, "
             f"plot_dpi={plot_dpi}"
         )
-        if known_data_from > 0 and mismatched_data_from == known_data_from:
+        if ctx["known_data_from"] > 0 and ctx["mismatched_data_from"] == ctx["known_data_from"]:
             logger(
                 "Warning: selected CurvePoints DataFrom looks incompatible with selected "
-                f"result type prefix '{result_prefix}'."
+                f"result type prefix '{ctx['result_prefix']}'."
             )
         if curve_time_result_type_path:
             logger(f"Curve time result type: {curve_time_result_type_path}")
         else:
             logger("Curve time result type not resolved; using step/index time fallback.")
+
         phase_counter = 0
         for direction, phase_names in (("X", x_phase_names), ("Y", y_phase_names)):
             for phase_name in phase_names:
@@ -2712,43 +3040,7 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                     logger(f"{direction} {resolved_phase_name} skipped: phase has no steps.")
                     continue
 
-                phase_t_values = []
-                for st in step_list:
-                    try:
-                        phase_t_values.append(float(st.Reached.DynamicTime.value))
-                    except Exception:
-                        phase_t_values.append(float("nan"))
-
-                phase_dt = None
-                valid_times = [v for v in phase_t_values if np.isfinite(v)]
-                if len(valid_times) >= 2:
-                    try:
-                        phase_dt = _estimate_dt(np.asarray(valid_times, dtype=float))
-                    except Exception:
-                        phase_dt = None
-                if (phase_dt is None or phase_dt <= 0.0) and len(step_list) >= 2:
-                    try:
-                        t0 = float(step_list[0].Reached.DynamicTime.value)
-                        t1 = float(step_list[-1].Reached.DynamicTime.value)
-                        if np.isfinite(t0) and np.isfinite(t1) and t1 > t0:
-                            phase_dt = float((t1 - t0) / (len(step_list) - 1))
-                    except Exception:
-                        pass
-
-                if phase_dt is not None and phase_dt > 0.0:
-                    base_start = 0.0
-                    for value in phase_t_values:
-                        if np.isfinite(value):
-                            base_start = float(value)
-                            break
-                    arr = np.asarray(phase_t_values, dtype=float)
-                    if (not np.all(np.isfinite(arr))) or np.any(np.diff(arr) <= 0.0):
-                        phase_t_values = [
-                            float(base_start + phase_dt * idx) for idx in range(len(step_list))
-                        ]
-                else:
-                    phase_t_values = [float(i) for i in range(1, len(step_list) + 1)]
-
+                phase_t_values, phase_dt = _resolve_phase_time_series(step_list)
                 start_step = step_list[0]
                 end_step = step_list[-1]
                 step_count = len(step_list)
@@ -2768,32 +3060,17 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                         if n == 0:
                             raise RuntimeError("Empty acceleration series.")
 
-                        time_vals = None
-                        if curve_time_result_type is not None:
-                            try:
-                                raw_t = list(
-                                    g_o.getcurveresultspath(
-                                        [rec["obj"]],
-                                        start_step,
-                                        end_step,
-                                        curve_time_result_type,
-                                    )
-                                )
-                                t_vals = _safe_float_list(raw_t)
-                                if len(t_vals) == n:
-                                    time_vals = t_vals
-                            except Exception:
-                                time_vals = None
-
-                        if time_vals is None:
-                            if step_count >= n and step_count > 0:
-                                time_vals = phase_t_values[:n]
-                            elif phase_dt is not None and phase_dt > 0.0:
-                                start_t = phase_t_values[0] if phase_t_values else 0.0
-                                time_vals = [start_t + phase_dt * i for i in range(n)]
-                            else:
-                                time_vals = [float(i) for i in range(1, n + 1)]
-
+                        time_vals = _read_curve_time_values(
+                            g_o,
+                            rec["obj"],
+                            start_step,
+                            end_step,
+                            curve_time_result_type,
+                            n,
+                            step_count,
+                            phase_t_values,
+                            phase_dt,
+                        )
                         dt = None
                         try:
                             dt = _estimate_dt(np.asarray(time_vals, dtype=float))
@@ -2858,12 +3135,12 @@ def run_node_multiphase_spectrum_export(args, logger=print):
                                 "Category": "NodeRead",
                                 "Direction": direction,
                                 "Phase": resolved_phase_name,
-                                    "Series": series,
-                                    "CurvePointId": cp_id,
-                                    "Status": "OK",
-                                    "Message": f"{n} points, dt={dt:.6g}",
-                                }
-                            )
+                                "Series": series,
+                                "CurvePointId": cp_id,
+                                "Status": "OK",
+                                "Message": f"{n} points, dt={dt:.6g}",
+                            }
+                        )
                         logger(
                             f"{direction} {resolved_phase_name} | "
                             f"{series} ({rec_idx}/{len(selected)}) -> OK"
@@ -2887,10 +3164,11 @@ def run_node_multiphase_spectrum_export(args, logger=print):
 
         time_df = pd.DataFrame(time_rows)
         spectrum_long_df = pd.DataFrame(spectrum_rows)
+        detail = ""
         if spectrum_long_df.empty:
             warn_or_err = pd.DataFrame(status_rows)
             if not warn_or_err.empty:
-                mask = warn_or_err["Category"].isin(["PhaseSteps", "PhaseDt", "NodeRead"])
+                mask = warn_or_err["Category"].isin(["PhaseSteps", "NodeRead"])
                 text_list = warn_or_err[mask]["Message"].astype(str).dropna().tolist()[:3]
                 detail = " | ".join(text_list).strip()
                 status_rows.append(
@@ -2955,6 +3233,11 @@ def run_node_multiphase_spectrum_export(args, logger=print):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plot_dir = _ensure_plot_dir(out_path)
         chart_paths = []
+        node_map_df = pd.DataFrame(node_map_rows)
+
+        png_node_map = plot_dir / "node_selection_map.png"
+        if _plot_node_selection_map(ctx["model_node_cloud"], node_map_df, png_node_map, dpi=plot_dpi):
+            chart_paths.append(str(png_node_map))
 
         for direction in sorted(spectrum_long_df["Direction"].dropna().unique().tolist()):
             dir_time = time_df[time_df["Direction"] == direction].copy()
@@ -3052,6 +3335,7 @@ def run_node_multiphase_spectrum_export(args, logger=print):
         sheets = [
             ("Phases", phases_df),
             ("Selections", selections_df),
+            ("NodeMap", node_map_df),
             ("NodeTimeHistoryLong", time_df),
             ("NodeSpectrumLong", spectrum_long_df),
             ("NodeSpectrumMean", spectrum_mean_df),
@@ -3066,6 +3350,251 @@ def run_node_multiphase_spectrum_export(args, logger=print):
     finally:
         _safe_close_server(s_o)
 
+
+def run_node_stress_strain_export(args, logger=print):
+    x_phase_names = list(getattr(args, "x_phase_names", []) or [])
+    y_phase_names = list(getattr(args, "y_phase_names", []) or [])
+    selected_ids = list(getattr(args, "curvepoint_id", []) or [])
+    out_text = str(getattr(args, "stress_strain_out", "") or getattr(args, "out", "") or "").strip()
+    out_path = Path(out_text).expanduser()
+    plot_dpi = int(float(getattr(args, "plot_dpi", 150) or 150))
+    stress_result_type_path = str(getattr(args, "stress_result_type", "") or "").strip()
+    strain_result_type_path = str(getattr(args, "strain_result_type", "") or "").strip()
+    time_col = str(getattr(args, "time_col", "DynamicTime")).strip() or "DynamicTime"
+
+    if not str(getattr(args, "password", "")).strip():
+        raise RuntimeError("Password is required.")
+    if not x_phase_names and not y_phase_names:
+        raise RuntimeError("Select at least one X or Y phase.")
+    if not out_text:
+        raise RuntimeError("Stress-strain output path is required.")
+    if not stress_result_type_path or not strain_result_type_path:
+        raise RuntimeError("Stress and strain result types are required.")
+
+    s_o, g_o = _open_output_server(args.host, int(args.port), args.password)
+    try:
+        _ensure_output_result_types(g_o)
+        _ensure_active_output_project(g_o)
+        stress_result_type = resolve_result_type(g_o, stress_result_type_path)
+        strain_result_type = resolve_result_type(g_o, strain_result_type_path)
+        curve_time_result_type, curve_time_result_type_path = _resolve_curve_time_result_type(
+            g_o,
+            stress_result_type_path,
+            time_col,
+        )
+
+        ctx = _build_node_export_context(g_o, selected_ids, stress_result_type_path)
+        selected = ctx["selected"]
+        series_by_id = ctx["series_by_id"]
+        phase_map = ctx["phase_map"]
+        phases_rows = []
+        selection_rows = list(ctx["selection_rows"])
+        node_map_rows = list(ctx["node_map_rows"])
+        status_rows = []
+        stress_strain_rows = []
+
+        total_phase_count = len(x_phase_names) + len(y_phase_names)
+        logger(
+            f"Stress-strain run started: phases={total_phase_count}, "
+            f"curvepoints={len(selected)}, tau={stress_result_type_path}, "
+            f"gamma={strain_result_type_path}, plot_dpi={plot_dpi}"
+        )
+        if ctx["known_data_from"] > 0 and ctx["mismatched_data_from"] == ctx["known_data_from"]:
+            logger(
+                "Warning: selected CurvePoints DataFrom looks incompatible with selected "
+                f"result type prefix '{ctx['result_prefix']}'."
+            )
+        if curve_time_result_type_path:
+            logger(f"Curve time result type: {curve_time_result_type_path}")
+        else:
+            logger("Curve time result type not resolved; using step/index time fallback.")
+
+        phase_counter = 0
+        for direction, phase_names in (("X", x_phase_names), ("Y", y_phase_names)):
+            for phase_name in phase_names:
+                phase_counter += 1
+                try:
+                    phase = _resolve_phase_by_name(phase_map, phase_name)
+                except Exception as exc:
+                    status_rows.append(
+                        {
+                            "Category": "PhaseResolve",
+                            "Direction": direction,
+                            "Phase": phase_name,
+                            "Series": "",
+                            "CurvePointId": "",
+                            "Status": "ERROR",
+                            "Message": _error_text(exc),
+                        }
+                    )
+                    continue
+
+                resolved_phase_name = _phase_display_name(phase)
+                logger(f"[{phase_counter}/{total_phase_count}] {direction} phase: {resolved_phase_name}")
+                phases_rows.append({"Direction": direction, "Phase": resolved_phase_name})
+                step_list = list(phase.Steps)
+                if not step_list:
+                    status_rows.append(
+                        {
+                            "Category": "PhaseSteps",
+                            "Direction": direction,
+                            "Phase": resolved_phase_name,
+                            "Series": "",
+                            "CurvePointId": "",
+                            "Status": "ERROR",
+                            "Message": "Phase has no steps.",
+                        }
+                    )
+                    logger(f"{direction} {resolved_phase_name} skipped: phase has no steps.")
+                    continue
+
+                phase_t_values, phase_dt = _resolve_phase_time_series(step_list)
+                start_step = step_list[0]
+                end_step = step_list[-1]
+                step_count = len(step_list)
+
+                for rec_idx, rec in enumerate(selected, start=1):
+                    cp_id = rec["id"]
+                    series = series_by_id.get(cp_id, rec["name"])
+                    try:
+                        tau_vals = _safe_float_list(
+                            g_o.getcurveresultspath([rec["obj"]], start_step, end_step, stress_result_type)
+                        )
+                        gamma_vals = _safe_float_list(
+                            g_o.getcurveresultspath([rec["obj"]], start_step, end_step, strain_result_type)
+                        )
+                        m = min(len(tau_vals), len(gamma_vals))
+                        if m <= 0:
+                            raise RuntimeError("Empty stress-strain series.")
+
+                        time_vals = _read_curve_time_values(
+                            g_o,
+                            rec["obj"],
+                            start_step,
+                            end_step,
+                            curve_time_result_type,
+                            m,
+                            step_count,
+                            phase_t_values,
+                            phase_dt,
+                        )
+
+                        for idx, (t_val, gamma_val, tau_val) in enumerate(
+                            zip(time_vals[:m], gamma_vals[:m], tau_vals[:m]),
+                            start=1,
+                        ):
+                            stress_strain_rows.append(
+                                {
+                                    "Direction": direction,
+                                    "Phase": resolved_phase_name,
+                                    "CurvePointId": cp_id,
+                                    "Series": series,
+                                    "NodeName": rec["node_name"],
+                                    "Step": idx,
+                                    time_col: float(t_val),
+                                    "Gamma_xy": float(gamma_val),
+                                    "Tau_xy": float(tau_val),
+                                }
+                            )
+
+                        status_rows.append(
+                            {
+                                "Category": "StressStrainRead",
+                                "Direction": direction,
+                                "Phase": resolved_phase_name,
+                                "Series": series,
+                                "CurvePointId": cp_id,
+                                "Status": "OK",
+                                "Message": f"{m} points",
+                            }
+                        )
+                        logger(
+                            f"{direction} {resolved_phase_name} | "
+                            f"{series} ({rec_idx}/{len(selected)}) -> OK"
+                        )
+                    except Exception as exc:
+                        status_rows.append(
+                            {
+                                "Category": "StressStrainRead",
+                                "Direction": direction,
+                                "Phase": resolved_phase_name,
+                                "Series": series,
+                                "CurvePointId": cp_id,
+                                "Status": "ERROR",
+                                "Message": _error_text(exc),
+                            }
+                        )
+                        logger(
+                            f"{direction} {resolved_phase_name} | "
+                            f"{series} ({rec_idx}/{len(selected)}) -> ERROR: {_error_text(exc)}"
+                        )
+
+        stress_strain_df = pd.DataFrame(stress_strain_rows)
+        if stress_strain_df.empty:
+            detail = ""
+            warn_or_err = pd.DataFrame(status_rows)
+            if not warn_or_err.empty:
+                mask = warn_or_err["Category"].isin(["PhaseSteps", "StressStrainRead"])
+                text_list = warn_or_err[mask]["Message"].astype(str).dropna().tolist()[:3]
+                detail = " | ".join(text_list).strip()
+            if detail:
+                raise RuntimeError(
+                    "No stress-strain data could be read for selected phases/curve points. "
+                    f"Details: {detail}"
+                )
+            raise RuntimeError("No stress-strain data could be read for selected phases/curve points.")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_dir = _ensure_plot_dir(out_path)
+        chart_paths = []
+        node_map_df = pd.DataFrame(node_map_rows)
+
+        png_node_map = plot_dir / "node_selection_map.png"
+        if _plot_node_selection_map(ctx["model_node_cloud"], node_map_df, png_node_map, dpi=plot_dpi):
+            chart_paths.append(str(png_node_map))
+
+        for direction in sorted(stress_strain_df["Direction"].dropna().unique().tolist()):
+            dir_df = stress_strain_df[stress_strain_df["Direction"] == direction].copy()
+            for series in sorted(dir_df["Series"].dropna().unique().tolist()):
+                one = dir_df[dir_df["Series"] == series].copy()
+                png_loop = plot_dir / f"stress_strain_{direction}_{safe_label(series)}.png"
+                if _plot_stress_strain_single(direction, series, one, png_loop, dpi=plot_dpi):
+                    chart_paths.append(str(png_loop))
+
+        for path_text in chart_paths:
+            logger(f"Chart -> {path_text}")
+            status_rows.append(
+                {
+                    "Category": "Chart",
+                    "Direction": "",
+                    "Phase": "",
+                    "Series": "",
+                    "CurvePointId": "",
+                    "Status": "OK",
+                    "Message": path_text,
+                }
+            )
+
+        phases_df = pd.DataFrame(phases_rows).drop_duplicates()
+        selections_df = pd.DataFrame(selection_rows).drop_duplicates()
+        status_df = pd.DataFrame(status_rows)
+        stress_strain_wide_specs = _build_stress_strain_wide_specs(stress_strain_df)
+
+        sheets = [
+            ("Phases", phases_df),
+            ("Selections", selections_df),
+            ("NodeMap", node_map_df),
+            ("StressStrainLong", stress_strain_df),
+            ("_Status", status_df),
+        ]
+        for spec in stress_strain_wide_specs:
+            sheets.append((spec["sheet_name"], spec["frame"]))
+        out_final = _write_multisheet_workbook(out_path, sheets, logger=logger)
+        _add_excel_line_charts(out_final, stress_strain_wide_specs, logger=logger)
+        logger(f"OK -> {out_final}")
+        logger(f"Charts -> {plot_dir}")
+    finally:
+        _safe_close_server(s_o)
 
 def main():
     args = parse_args()

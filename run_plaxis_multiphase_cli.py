@@ -191,6 +191,52 @@ def run_node_mode(args):
     )
 
 
+def run_stress_strain_mode(args):
+    password = _resolve_password(args.password)
+    phases, x_names, y_names = _phase_lists(
+        args.host,
+        args.port,
+        password,
+        args.x_regex,
+        args.y_regex,
+    )
+    _log(f"Loaded phases: total={len(phases)} x={len(x_names)} y={len(y_names)}")
+    if not x_names and not y_names:
+        raise RuntimeError("No phases matched x/y regex.")
+
+    curve_records = core.list_curve_points_api(args.host, args.port, password)
+    _log(f"Loaded curve points: {len(curve_records)}")
+    selected_ids = _resolve_curvepoint_ids(
+        curve_records,
+        args.curvepoint_id,
+        args.curvepoint_regex,
+    )
+    if selected_ids:
+        _log(f"Using filtered curve points: {len(selected_ids)}")
+    else:
+        _log("Using all curve points.")
+
+    run_args = SimpleNamespace(
+        host=args.host,
+        port=args.port,
+        password=password,
+        x_phase_names=x_names,
+        y_phase_names=y_names,
+        curvepoint_id=selected_ids,
+        stress_result_type=args.stress_result_type,
+        strain_result_type=args.strain_result_type,
+        stress_strain_out=args.out,
+        time_col=args.time_col,
+        plot_dpi=int(args.plot_dpi),
+    )
+
+    _run_with_retry(
+        lambda: core.run_node_stress_strain_export(run_args, logger=_log),
+        attempts=args.attempts,
+        sleep_sec=args.retry_sleep,
+    )
+
+
 def run_structural_mode(args):
     password = _resolve_password(args.password)
     phases, x_names, y_names = _phase_lists(
@@ -274,10 +320,23 @@ def build_parser():
     n.add_argument(
         "--save-node-timehistory-subfolders",
         action="store_true",
-        help="Write per-phase node time history CSV files under an output subfolder.",
+        help="Write flat TXT node time history files under the output time_history folder.",
     )
     n.add_argument("--curvepoint-id", action="append", default=[])
     n.add_argument(
+        "--curvepoint-regex",
+        action="append",
+        default=[],
+        help="Filter curvepoints by regex on name/node/label. Can repeat.",
+    )
+
+    ss = sub.add_parser("stress-strain", help="Run node stress-strain export.")
+    add_common(ss)
+    ss.add_argument("--stress-result-type", default="Soil.Sigxy")
+    ss.add_argument("--strain-result-type", default="Soil.Gamxy")
+    ss.add_argument("--time-col", default="DynamicTime")
+    ss.add_argument("--curvepoint-id", action="append", default=[])
+    ss.add_argument(
         "--curvepoint-regex",
         action="append",
         default=[],
@@ -311,6 +370,8 @@ def main():
     try:
         if args.mode == "node":
             run_node_mode(args)
+        elif args.mode == "stress-strain":
+            run_stress_strain_mode(args)
         elif args.mode == "structural":
             run_structural_mode(args)
         else:

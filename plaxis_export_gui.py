@@ -78,9 +78,14 @@ class PlaxisExportApp(tk.Tk):
         self.hist_out_node = tk.StringVar(
             value=r"C:\Users\PC\OneDrive\Desktop\PLAXIS_multiphase_node_results.xlsx"
         )
+        self.hist_out_stress_strain = tk.StringVar(
+            value=r"C:\Users\PC\OneDrive\Desktop\PLAXIS_multiphase_stress_strain_output.xlsx"
+        )
         self.phase_regex_x = tk.StringVar(value=r"^DD2_X_.*")
         self.phase_regex_y = tk.StringVar(value=r"^DD2_Y_.*")
         self.hist_result_type = tk.StringVar(value="Soil.Ax")
+        self.hist_stress_result_type = tk.StringVar(value="Soil.Sigxy")
+        self.hist_strain_result_type = tk.StringVar(value="Soil.Gamxy")
         self.hist_time_col = tk.StringVar(value="DynamicTime")
         self.hist_damping = tk.StringVar(value="0.05")
         self.hist_period_start = tk.StringVar(value="0.01")
@@ -140,22 +145,33 @@ class PlaxisExportApp(tk.Tk):
         browse_node_out.grid(row=4, column=2, padx=6, pady=4, sticky="w")
         self.busy_widgets.append(browse_node_out)
 
+        self._add_labeled_entry(api, 5, "Stress-strain output:", self.hist_out_stress_strain)
+        browse_stress_out = ttk.Button(
+            api,
+            text="Browse",
+            command=lambda: self._pick_file(self.hist_out_stress_strain, save=True),
+        )
+        browse_stress_out.grid(row=5, column=2, padx=6, pady=4, sticky="w")
+        self.busy_widgets.append(browse_stress_out)
+
         analysis = ttk.LabelFrame(inner, text="Node Spectrum Settings")
         analysis.pack(fill="x", padx=8, pady=(0, 8))
         analysis.columnconfigure(1, weight=1)
         self._add_labeled_entry(analysis, 0, "Accel result type:", self.hist_result_type)
-        self._add_labeled_entry(analysis, 1, "Time column:", self.hist_time_col)
-        self._add_labeled_entry(analysis, 2, "Damping ratio:", self.hist_damping)
-        self._add_labeled_entry(analysis, 3, "Period start (s):", self.hist_period_start)
-        self._add_labeled_entry(analysis, 4, "Period end (s):", self.hist_period_end)
-        self._add_labeled_entry(analysis, 5, "Period step (s):", self.hist_period_step)
-        self._add_labeled_entry(analysis, 6, "PNG DPI:", self.hist_plot_dpi)
+        self._add_labeled_entry(analysis, 1, "Tauxy result type:", self.hist_stress_result_type)
+        self._add_labeled_entry(analysis, 2, "Gamxy result type:", self.hist_strain_result_type)
+        self._add_labeled_entry(analysis, 3, "Time column:", self.hist_time_col)
+        self._add_labeled_entry(analysis, 4, "Damping ratio:", self.hist_damping)
+        self._add_labeled_entry(analysis, 5, "Period start (s):", self.hist_period_start)
+        self._add_labeled_entry(analysis, 6, "Period end (s):", self.hist_period_end)
+        self._add_labeled_entry(analysis, 7, "Period step (s):", self.hist_period_step)
+        self._add_labeled_entry(analysis, 8, "PNG DPI:", self.hist_plot_dpi)
         save_hist_chk = ttk.Checkbutton(
             analysis,
-            text="Save node time histories into phase subfolders",
+            text="Save node time histories as TXT files",
             variable=self.hist_save_phase_timehistory,
         )
-        save_hist_chk.grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+        save_hist_chk.grid(row=9, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 6))
         self.busy_widgets.append(save_hist_chk)
 
         phase_box = ttk.LabelFrame(inner, text="Phase Selection (Regex + Manual)")
@@ -352,7 +368,11 @@ class PlaxisExportApp(tk.Tk):
             run_frame, text="Run Node Spectrum Analysis", command=self.run_node_multiphase_export
         )
         run_node_btn.pack(side="left", padx=6, pady=6)
-        self.busy_widgets.extend([run_struct_btn, run_node_btn])
+        run_stress_btn = ttk.Button(
+            run_frame, text="Run Stress-Strain Output", command=self.run_node_stress_strain_export
+        )
+        run_stress_btn.pack(side="left", padx=6, pady=6)
+        self.busy_widgets.extend([run_struct_btn, run_node_btn, run_stress_btn])
 
     def _add_labeled_entry(self, parent, row, label, var, show=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=4)
@@ -798,6 +818,66 @@ class PlaxisExportApp(tk.Tk):
 
             raise RuntimeError(
                 "Node spectrum analysis failed on all candidate ports. "
+                f"Last error: {str(last_error).strip() or repr(last_error)}"
+            )
+
+        self._run_background(task)
+
+    def run_node_stress_strain_export(self):
+        def task():
+            if not self.hist_password.get().strip():
+                raise RuntimeError("Password is required for Output API connection.")
+
+            x_phase_names = self._selected_phase_names(self.x_phase_list)
+            y_phase_names = self._selected_phase_names(self.y_phase_list)
+            if not x_phase_names and not y_phase_names:
+                raise RuntimeError("Select at least one X or Y phase.")
+            for msg in self._phase_direction_warnings(x_phase_names, y_phase_names):
+                self._log_async(msg)
+
+            selected_indices = self.api_nodes_list.curselection()
+            selected_labels = [self.api_nodes_list.get(i) for i in selected_indices]
+            selected_ids = [
+                self.api_curvepoint_ids[label]
+                for label in selected_labels
+                if label in self.api_curvepoint_ids
+            ]
+
+            host = self.hist_host.get().strip()
+            password = self.hist_password.get().strip()
+            ports = self._candidate_ports()
+            last_error = None
+            for port in ports:
+                args = SimpleNamespace(
+                    host=host,
+                    port=port,
+                    password=password,
+                    x_phase_names=x_phase_names,
+                    y_phase_names=y_phase_names,
+                    curvepoint_id=selected_ids,
+                    stress_result_type=self.hist_stress_result_type.get().strip(),
+                    strain_result_type=self.hist_strain_result_type.get().strip(),
+                    time_col=self.hist_time_col.get().strip(),
+                    plot_dpi=int(float(self.hist_plot_dpi.get().strip())),
+                    stress_strain_out=self.hist_out_stress_strain.get().strip(),
+                )
+                try:
+                    self._log_async(f"Stress-strain analysis via port {port}...")
+                    core.run_node_stress_strain_export(
+                        args, logger=lambda msg: self.after(0, lambda m=msg: self.log(m))
+                    )
+                    self.after(0, lambda p=port: self.hist_port.set(str(p)))
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    err_text = str(exc).strip() or repr(exc)
+                    self._log_async(f"Port {port} stress-strain run failed: {err_text}")
+                    if not self._is_retryable_port_error(exc):
+                        raise RuntimeError(err_text) from exc
+                    continue
+
+            raise RuntimeError(
+                "Stress-strain analysis failed on all candidate ports. "
                 f"Last error: {str(last_error).strip() or repr(last_error)}"
             )
 
