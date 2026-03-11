@@ -361,7 +361,7 @@ class PlaxisExportApp(tk.Tk):
         run_frame = ttk.LabelFrame(inner, text="Run")
         run_frame.pack(fill="x", padx=8, pady=(0, 10))
         run_struct_btn = ttk.Button(
-            run_frame, text="Run Structural Moment Analysis", command=self.run_structural_moment_export
+            run_frame, text="Run Structural Output", command=self.run_structural_moment_export
         )
         run_struct_btn.pack(side="left", padx=6, pady=6)
         run_node_btn = ttk.Button(
@@ -736,7 +736,7 @@ class PlaxisExportApp(tk.Tk):
                     out=self.hist_out_struct.get().strip(),
                 )
                 try:
-                    self._log_async(f"Structural analysis via port {port}...")
+                    self._log_async(f"Structural output via port {port}...")
                     core.run_structural_moment_export(
                         args, logger=lambda msg: self.after(0, lambda m=msg: self.log(m))
                     )
@@ -751,7 +751,7 @@ class PlaxisExportApp(tk.Tk):
                     continue
 
             raise RuntimeError(
-                "Structural analysis failed on all candidate ports. "
+                "Structural output failed on all candidate ports. "
                 f"Last error: {str(last_error).strip() or repr(last_error)}"
             )
 

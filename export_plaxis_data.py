@@ -1648,6 +1648,60 @@ def _get_results_numeric(g_o, obj, phase, result_type_obj, location, context):
     return _safe_numeric_array(raw, context)
 
 
+def _first_attr(obj, names):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if value is not None:
+            return value, name
+    return None, ""
+
+
+def _resolve_structural_result_types(rt_group):
+    candidates = {
+        "M": (
+            ["MEnvelopeMax2D", "M_EnvelopeMax2D", "MEnvelopeMax"],
+            ["MEnvelopeMin2D", "M_EnvelopeMin2D", "MEnvelopeMin"],
+        ),
+        "N": (
+            [
+                "NEnvelopeMax2D",
+                "N_EnvelopeMax2D",
+                "NxEnvelopeMax2D",
+                "Nx_EnvelopeMax2D",
+                "NEnvelopeMax",
+                "NxEnvelopeMax",
+            ],
+            [
+                "NEnvelopeMin2D",
+                "N_EnvelopeMin2D",
+                "NxEnvelopeMin2D",
+                "Nx_EnvelopeMin2D",
+                "NEnvelopeMin",
+                "NxEnvelopeMin",
+            ],
+        ),
+        "Q": (
+            ["QEnvelopeMax2D", "Q_EnvelopeMax2D", "QEnvelopeMax"],
+            ["QEnvelopeMin2D", "Q_EnvelopeMin2D", "QEnvelopeMin"],
+        ),
+    }
+    resolved = {}
+    for key, (max_names, min_names) in candidates.items():
+        max_rt, max_name = _first_attr(rt_group, max_names)
+        min_rt, min_name = _first_attr(rt_group, min_names)
+        resolved[key] = {
+            "max": max_rt,
+            "min": min_rt,
+            "max_name": max_name,
+            "min_name": min_name,
+            "available": (max_rt is not None and min_rt is not None),
+        }
+    return resolved
+
+
 def _find_geometry_phase(g_o):
     phases = list(g_o.Phases)
     for phase in phases:
@@ -1910,9 +1964,10 @@ def _build_stress_strain_wide_specs(stress_strain_df):
                 if one.empty:
                     continue
                 phase_base = _phase_base_name(phase_name)
-                x_col = f"{phase_base}_GammaXY"
-                y_col = f"{phase_base}_TauXY"
-                one = one.rename(columns={"Gamma_xy": x_col, "Tau_xy": y_col})
+                x_col = f"{phase_base}_ShearStrain_pct"
+                y_col = f"{phase_base}_ShearStress"
+                one = one.assign(Gamma_xy_pct=pd.to_numeric(one["Gamma_xy"], errors="coerce") * 100.0)
+                one = one.rename(columns={"Gamma_xy_pct": x_col, "Tau_xy": y_col})
                 frames.append(one[[x_col, y_col]])
                 series_pairs.append({"x_col": col_cursor, "y_col": col_cursor + 1, "title": phase_base})
                 col_cursor += 2
@@ -1926,23 +1981,68 @@ def _build_stress_strain_wide_specs(stress_strain_df):
                 {
                     "sheet_name": sheet_name,
                     "frame": wide,
-                    "chart_title": f"{direction} | {series} | Tauxy-Gamxy",
-                    "x_axis_title": "Gamma_xy",
-                    "y_axis_title": "Tau_xy",
+                    "chart_title": f"{direction} | {series} | Shear Stress-Shear Strain",
+                    "x_axis_title": "Shear Strain (%)",
+                    "y_axis_title": "Shear Stress",
                     "chart_type": "scatter",
                     "series_pairs": series_pairs,
                     "chart_width": 18.0,
                     "chart_height": 8.5,
+                    "x_num_fmt": "0.000",
                 }
             )
 
     return specs
 
 
-def _build_structural_moment_wide_specs(avg_df):
+STRUCTURAL_COMPONENT_SPECS = (
+    {
+        "key": "M",
+        "label": "Moment",
+        "plus_col": "MPlus",
+        "minus_col": "MMinus",
+        "sheet_prefix": "MomentWide",
+        "plot_prefix": "moment",
+        "chart_title": "Moment-Profile Distance",
+        "y_axis_title": "Moment (kNm)",
+    },
+    {
+        "key": "N",
+        "label": "Normal Force",
+        "plus_col": "NPlus",
+        "minus_col": "NMinus",
+        "sheet_prefix": "NormalWide",
+        "plot_prefix": "normal_force",
+        "chart_title": "Normal Force-Profile Distance",
+        "y_axis_title": "Normal Force",
+    },
+    {
+        "key": "Q",
+        "label": "Shear Force",
+        "plus_col": "QPlus",
+        "minus_col": "QMinus",
+        "sheet_prefix": "ShearWide",
+        "plot_prefix": "shear_force",
+        "chart_title": "Shear Force-Profile Distance",
+        "y_axis_title": "Shear Force",
+    },
+)
+
+
+def _get_structural_component_spec(component_key):
+    for spec in STRUCTURAL_COMPONENT_SPECS:
+        if spec["key"] == component_key:
+            return spec
+    raise KeyError(f"Unknown structural component: {component_key}")
+
+
+def _build_structural_component_wide_specs(avg_df, component_key):
     if avg_df.empty:
         return []
 
+    spec = _get_structural_component_spec(component_key)
+    plus_col = spec["plus_col"]
+    minus_col = spec["minus_col"]
     used_names = set(
         [
             sanitize_sheet_name("Phases"),
@@ -1967,17 +2067,18 @@ def _build_structural_moment_wide_specs(avg_df):
             object_names = sorted(sub["ObjectName"].dropna().unique().tolist())
             for object_name in object_names:
                 one = (
-                    sub[sub["ObjectName"] == object_name][["Depth", "MPlus", "MMinus"]]
+                    sub[sub["ObjectName"] == object_name][["Depth", plus_col, minus_col]]
                     .dropna(subset=["Depth"])
+                    .dropna(subset=[plus_col, minus_col], how="all")
                     .sort_values("Depth")
                     .reset_index(drop=True)
                 )
                 if one.empty:
                     continue
                 c_depth = f"{object_name}_Depth"
-                c_plus = f"{object_name}_MPlus"
-                c_minus = f"{object_name}_MMinus"
-                one = one.rename(columns={"Depth": c_depth, "MPlus": c_plus, "MMinus": c_minus})
+                c_plus = f"{object_name}_{plus_col}"
+                c_minus = f"{object_name}_{minus_col}"
+                one = one.rename(columns={"Depth": c_depth, plus_col: c_plus, minus_col: c_minus})
                 frames.append(one[[c_depth, c_plus, c_minus]])
                 series_pairs.append(
                     {
@@ -1999,14 +2100,17 @@ def _build_structural_moment_wide_specs(avg_df):
                 continue
 
             wide = pd.concat(frames, axis=1)
-            sheet_name = _unique_sheet_name(f"MomentWide_{direction}_{object_group}", used_names)
+            sheet_name = _unique_sheet_name(
+                f"{spec['sheet_prefix']}_{direction}_{object_group}",
+                used_names,
+            )
             specs.append(
                 {
                     "sheet_name": sheet_name,
                     "frame": wide,
-                    "chart_title": f"{direction} | {object_group} | Moment-Depth",
-                    "x_axis_title": "Depth",
-                    "y_axis_title": "Moment (kNm)",
+                    "chart_title": f"{direction} | {object_group} | {spec['chart_title']}",
+                    "x_axis_title": "Profile Distance (m)",
+                    "y_axis_title": spec["y_axis_title"],
                     "chart_type": "scatter",
                     "series_pairs": series_pairs,
                     "chart_width": 18.5,
@@ -2129,7 +2233,7 @@ def _short_plot_label(text, max_len=40):
     return f"{out[: max_len - 3].rstrip()}..."
 
 
-def _apply_compact_legend(fig, ax):
+def _apply_compact_legend(fig, ax, prefer_right=False, right_rect=0.82):
     handles, labels = ax.get_legend_handles_labels()
     items = [(h, l) for h, l in zip(handles, labels) if l and l != "_nolegend_"]
     if len(items) <= 1:
@@ -2138,7 +2242,7 @@ def _apply_compact_legend(fig, ax):
 
     handles = [item[0] for item in items]
     labels = [item[1] for item in items]
-    if len(labels) <= 6:
+    if not prefer_right and len(labels) <= 6:
         ncol = min(3, max(1, math.ceil(len(labels) / 2)))
         ax.legend(
             handles,
@@ -2159,14 +2263,14 @@ def _apply_compact_legend(fig, ax):
         handles,
         labels,
         loc="center left",
-        bbox_to_anchor=(1.01, 0.5),
-        fontsize=7,
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=6.8,
         ncol=1,
         frameon=True,
         handlelength=1.6,
         borderaxespad=0.3,
     )
-    fig.tight_layout(rect=(0, 0, 0.82, 1))
+    fig.tight_layout(rect=(0, 0, right_rect, 1))
 
 
 def _anchor_axes_at_zero(ax, zero_x=False, zero_y=False):
@@ -2179,10 +2283,17 @@ def _anchor_axes_at_zero(ax, zero_x=False, zero_y=False):
         ax.set_ylim(bottom=0.0, top=max(0.0, top))
 
 
-def _plot_moment_group(avg_df, direction, object_group, out_png, dpi=150):
+def _plot_structural_component_group(avg_df, direction, object_group, component_key, out_png, dpi=150):
     subset = avg_df[
         (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
     ].copy()
+    if subset.empty:
+        return False
+
+    spec = _get_structural_component_spec(component_key)
+    plus_col = spec["plus_col"]
+    minus_col = spec["minus_col"]
+    subset = subset.dropna(subset=[plus_col, minus_col], how="all")
     if subset.empty:
         return False
 
@@ -2192,24 +2303,38 @@ def _plot_moment_group(avg_df, direction, object_group, out_png, dpi=150):
     cmap = plt.cm.get_cmap("tab20", max(len(names), 1))
 
     for idx, name in enumerate(names):
-        one = subset[subset["ObjectName"] == name].sort_values("Depth")
+        one = (
+            subset[subset["ObjectName"] == name]
+            .dropna(subset=[plus_col, minus_col], how="all")
+            .sort_values("Depth")
+        )
+        if one.empty:
+            continue
         color = cmap(idx % cmap.N)
         label_name = _short_plot_label(name, max_len=28)
-        ax.plot(one["MPlus"], one["Depth"], color=color, linewidth=1.7, label=f"{label_name} M+")
-        ax.plot(
-            one["MMinus"],
-            one["Depth"],
-            color=color,
-            linewidth=1.3,
-            linestyle="--",
-            label=f"{label_name} M-",
-        )
+        if one[plus_col].notna().any():
+            ax.plot(
+                one[plus_col],
+                one["Depth"],
+                color=color,
+                linewidth=1.7,
+                label=f"{label_name} {component_key}+",
+            )
+        if one[minus_col].notna().any():
+            ax.plot(
+                one[minus_col],
+                one["Depth"],
+                color=color,
+                linewidth=1.3,
+                linestyle="--",
+                label=f"{label_name} {component_key}-",
+            )
 
     ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.7)
     ax.invert_yaxis()
-    ax.set_xlabel("Moment (kNm)")
-    ax.set_ylabel("Depth")
-    ax.set_title(f"{direction} Direction | {object_group} | Mean +/- Envelope")
+    ax.set_xlabel(spec["y_axis_title"])
+    ax.set_ylabel("Profile Distance (m)")
+    ax.set_title(f"{direction} Direction | {object_group} | {spec['label']} Mean +/- Envelope")
     ax.grid(True, alpha=0.25)
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
@@ -2335,7 +2460,11 @@ def _plot_stress_strain_single(direction, series_name, frame, out_png, dpi=150):
     if frame.empty:
         return False
     plt = _mpl_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, (ax, legend_ax) = plt.subplots(
+        ncols=2,
+        figsize=(14, 6.5),
+        gridspec_kw={"width_ratios": [5.8, 1.6], "wspace": 0.03},
+    )
     for phase_name in sorted(frame["Phase"].dropna().unique().tolist()):
         one = (
             frame[frame["Phase"] == phase_name][["Gamma_xy", "Tau_xy"]]
@@ -2344,23 +2473,84 @@ def _plot_stress_strain_single(direction, series_name, frame, out_png, dpi=150):
         )
         if one.empty:
             continue
+        gamma_percent = pd.to_numeric(one["Gamma_xy"], errors="coerce") * 100.0
         ax.plot(
-            one["Gamma_xy"],
+            gamma_percent,
             one["Tau_xy"],
             linewidth=1.0,
             alpha=0.85,
-            label=_short_plot_label(_phase_base_name(phase_name), max_len=36),
+            label=_short_plot_label(_phase_base_name(phase_name), max_len=28),
         )
     ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.4)
     ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.4)
-    ax.set_xlabel("Gamma_xy")
-    ax.set_ylabel("Tau_xy")
-    ax.set_title(f"{direction} | {series_name} | Tauxy-Gamxy")
+    ax.set_xlabel("Shear Strain (%)")
+    ax.set_ylabel("Shear Stress")
+    ax.set_title(f"{direction} | {series_name} | Shear Stress-Shear Strain")
     ax.grid(True, alpha=0.25)
-    _apply_compact_legend(fig, ax)
-    fig.savefig(out_png, dpi=int(dpi))
+    legend_ax.axis("off")
+    handles, labels = ax.get_legend_handles_labels()
+    items = [(h, l) for h, l in zip(handles, labels) if l and l != "_nolegend_"]
+    if items:
+        legend_ax.legend(
+            [item[0] for item in items],
+            [item[1] for item in items],
+            loc="center left",
+            fontsize=6.8,
+            frameon=True,
+            handlelength=1.6,
+            borderaxespad=0.2,
+            labelspacing=0.45,
+        )
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.12, top=0.90, wspace=0.02)
+    fig.savefig(out_png, dpi=int(dpi), bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     return True
+
+
+def _profile_distance_from_xy(x_vals, y_vals):
+    x_arr = np.asarray(x_vals, dtype=float)
+    y_arr = np.asarray(y_vals, dtype=float)
+    n = min(len(x_arr), len(y_arr))
+    if n == 0:
+        return np.zeros(0, dtype=float)
+
+    x_arr = x_arr[:n]
+    y_arr = y_arr[:n]
+    out = np.zeros(n, dtype=float)
+    finite = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not finite.any():
+        return out
+
+    pts = np.column_stack((x_arr[finite], y_arr[finite]))
+    if len(pts) <= 1:
+        out[finite] = 0.0
+        return out
+
+    centered = pts - pts.mean(axis=0)
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        axis = np.asarray(vh[0], dtype=float)
+    except Exception:
+        axis = np.array([1.0, 0.0], dtype=float)
+
+    if (not np.all(np.isfinite(axis))) or np.allclose(axis, 0.0):
+        spread_x = float(np.nanmax(pts[:, 0]) - np.nanmin(pts[:, 0]))
+        spread_y = float(np.nanmax(pts[:, 1]) - np.nanmin(pts[:, 1]))
+        axis = np.array([1.0, 0.0], dtype=float) if spread_x >= spread_y else np.array([0.0, 1.0], dtype=float)
+
+    horizontal = abs(axis[0]) > abs(axis[1])
+    if horizontal and axis[0] < 0.0:
+        axis = -axis
+    if (not horizontal) and axis[1] < 0.0:
+        axis = -axis
+
+    proj = pts @ axis
+    if horizontal:
+        dist = proj - float(np.nanmin(proj))
+    else:
+        dist = float(np.nanmax(proj)) - proj
+    out[finite] = dist
+    return out
 
 
 def _collect_model_node_cloud(g_o, max_points=25000):
@@ -2612,9 +2802,13 @@ def _apply_plate_group_merge(raw_df, merge_group1=False, merge_group2=False):
 
         out.loc[mask, "ObjectName"] = merged_name
         key_cols = ["Direction", "Phase", "ObjectGroup", "ObjectName"]
-        sub = out.loc[mask, key_cols + ["Y"]].copy()
-        top_y = sub.groupby(key_cols)["Y"].transform("max")
-        out.loc[mask, "Depth"] = (top_y - sub["Y"]).to_numpy()
+        grouped = out.loc[mask].groupby(key_cols, sort=False).groups
+        for row_index in grouped.values():
+            coords = out.loc[row_index, ["X", "Y"]]
+            out.loc[row_index, "Depth"] = _profile_distance_from_xy(
+                coords["X"].to_numpy(),
+                coords["Y"].to_numpy(),
+            )
 
     return out
 
@@ -2718,10 +2912,30 @@ def run_structural_moment_export(args, logger=print):
         plate_map = _entity_map_by_name(list(g_o.Plates))
 
         selected_groups = [
-            ("Pile", "EmbeddedBeam", pile_names, pile_map, g_o.ResultTypes.EmbeddedBeam),
-            ("PlateGroup1", "Plate", plate_group1, plate_map, g_o.ResultTypes.Plate),
-            ("PlateGroup2", "Plate", plate_group2, plate_map, g_o.ResultTypes.Plate),
+            {
+                "object_group": "Pile",
+                "object_type": "EmbeddedBeam",
+                "names": pile_names,
+                "obj_map": pile_map,
+                "rt_group": g_o.ResultTypes.EmbeddedBeam,
+            },
+            {
+                "object_group": "PlateGroup1",
+                "object_type": "Plate",
+                "names": plate_group1,
+                "obj_map": plate_map,
+                "rt_group": g_o.ResultTypes.Plate,
+            },
+            {
+                "object_group": "PlateGroup2",
+                "object_type": "Plate",
+                "names": plate_group2,
+                "obj_map": plate_map,
+                "rt_group": g_o.ResultTypes.Plate,
+            },
         ]
+        for group in selected_groups:
+            group["resolved_components"] = _resolve_structural_result_types(group["rt_group"])
 
         phases_rows = []
         selection_rows = []
@@ -2734,6 +2948,32 @@ def run_structural_moment_export(args, logger=print):
             f"piles={len(pile_names)}, plate_g1={len(plate_group1)}, plate_g2={len(plate_group2)}, "
             f"merge_g1={int(merge_plate_group1)}, merge_g2={int(merge_plate_group2)}"
         )
+        for group in selected_groups:
+            names = list(group["names"])
+            if not names:
+                continue
+            missing = [
+                _get_structural_component_spec(key)["label"]
+                for key, info in group["resolved_components"].items()
+                if not info["available"]
+            ]
+            if missing:
+                message = (
+                    f"{group['object_group']} result types not found for: {', '.join(missing)}. "
+                    "Those outputs will be skipped."
+                )
+                logger(f"Warning: {message}")
+                status_rows.append(
+                    {
+                        "Category": "ResultTypeResolve",
+                        "Direction": "",
+                        "Phase": "",
+                        "ObjectGroup": group["object_group"],
+                        "ObjectName": "",
+                        "Status": "WARN",
+                        "Message": message,
+                    }
+                )
         phase_counter = 0
         for direction, phase_names in (("X", x_phase_names), ("Y", y_phase_names)):
             for phase_name in phase_names:
@@ -2757,8 +2997,12 @@ def run_structural_moment_export(args, logger=print):
                 resolved_phase_name = _phase_display_name(phase)
                 logger(f"[{phase_counter}/{total_phase_count}] {direction} phase: {resolved_phase_name}")
                 phases_rows.append({"Direction": direction, "Phase": resolved_phase_name})
-                for object_group, object_type, names, obj_map, rt_group in selected_groups:
-                    for object_name in names:
+                for group in selected_groups:
+                    object_group = group["object_group"]
+                    object_type = group["object_type"]
+                    obj_map = group["obj_map"]
+                    resolved_components = group["resolved_components"]
+                    for object_name in group["names"]:
                         selection_rows.append(
                             {
                                 "SelectionType": object_group,
@@ -2783,34 +3027,58 @@ def run_structural_moment_export(args, logger=print):
 
                         context = f"{direction}:{resolved_phase_name}:{object_group}:{object_name}"
                         try:
-                            x = _get_results_numeric(g_o, obj, phase, rt_group.X, "node", f"{context}:X")
-                            y = _get_results_numeric(g_o, obj, phase, rt_group.Y, "node", f"{context}:Y")
-                            m_plus = _get_results_numeric(
-                                g_o,
-                                obj,
-                                phase,
-                                rt_group.MEnvelopeMax2D,
-                                "node",
-                                f"{context}:M+",
+                            x = _get_results_numeric(
+                                g_o, obj, phase, group["rt_group"].X, "node", f"{context}:X"
                             )
-                            m_minus = _get_results_numeric(
-                                g_o,
-                                obj,
-                                phase,
-                                rt_group.MEnvelopeMin2D,
-                                "node",
-                                f"{context}:M-",
+                            y = _get_results_numeric(
+                                g_o, obj, phase, group["rt_group"].Y, "node", f"{context}:Y"
                             )
-                            n = min(len(x), len(y), len(m_plus), len(m_minus))
+                            component_values = {}
+                            component_names = []
+                            lengths = [len(x), len(y)]
+                            for component_key in ("M", "N", "Q"):
+                                info = resolved_components.get(component_key, {})
+                                if not info.get("available"):
+                                    component_values[component_key] = (None, None)
+                                    continue
+                                plus_vals = _get_results_numeric(
+                                    g_o,
+                                    obj,
+                                    phase,
+                                    info["max"],
+                                    "node",
+                                    f"{context}:{component_key}+",
+                                )
+                                minus_vals = _get_results_numeric(
+                                    g_o,
+                                    obj,
+                                    phase,
+                                    info["min"],
+                                    "node",
+                                    f"{context}:{component_key}-",
+                                )
+                                component_values[component_key] = (plus_vals, minus_vals)
+                                component_names.append(component_key)
+                                lengths.extend([len(plus_vals), len(minus_vals)])
+                            if not component_names:
+                                raise RuntimeError("No force/moment envelope result types available.")
+                            n = min(lengths) if lengths else 0
                             if n == 0:
                                 raise RuntimeError("No numeric node results.")
                             x = x[:n]
                             y = y[:n]
-                            m_plus = m_plus[:n]
-                            m_minus = m_minus[:n]
-                            depth = float(np.nanmax(y)) - y
+                            trimmed_components = {}
+                            for component_key, pair in component_values.items():
+                                if pair[0] is None or pair[1] is None:
+                                    trimmed_components[component_key] = (np.nan, np.nan)
+                                    continue
+                                trimmed_components[component_key] = (pair[0][:n], pair[1][:n])
+                            depth = _profile_distance_from_xy(x, y)
 
                             for i in range(n):
+                                m_plus, m_minus = trimmed_components["M"]
+                                n_plus, n_minus = trimmed_components["N"]
+                                q_plus, q_minus = trimmed_components["Q"]
                                 raw_rows.append(
                                     {
                                         "Direction": direction,
@@ -2821,29 +3089,34 @@ def run_structural_moment_export(args, logger=print):
                                         "X": float(x[i]),
                                         "Y": float(y[i]),
                                         "Depth": float(depth[i]),
-                                        "MPlus": float(m_plus[i]),
-                                        "MMinus": float(m_minus[i]),
+                                        "MPlus": float(m_plus[i]) if np.ndim(m_plus) else np.nan,
+                                        "MMinus": float(m_minus[i]) if np.ndim(m_minus) else np.nan,
+                                        "NPlus": float(n_plus[i]) if np.ndim(n_plus) else np.nan,
+                                        "NMinus": float(n_minus[i]) if np.ndim(n_minus) else np.nan,
+                                        "QPlus": float(q_plus[i]) if np.ndim(q_plus) else np.nan,
+                                        "QMinus": float(q_minus[i]) if np.ndim(q_minus) else np.nan,
                                     }
                                 )
                             status_rows.append(
                                 {
-                                    "Category": "MomentRead",
+                                    "Category": "StructuralRead",
                                     "Direction": direction,
                                     "Phase": resolved_phase_name,
                                     "ObjectGroup": object_group,
                                     "ObjectName": object_name,
                                     "Status": "OK",
-                                    "Message": f"{n} points",
+                                    "Message": f"{n} points | components={','.join(component_names) or 'none'}",
                                 }
                             )
                             logger(
                                 f"{direction} {resolved_phase_name} | "
-                                f"{object_group}:{object_name} -> {n} points"
+                                f"{object_group}:{object_name} -> {n} points | "
+                                f"components={','.join(component_names) or 'none'}"
                             )
                         except Exception as exc:
                             status_rows.append(
                                 {
-                                    "Category": "MomentRead",
+                                    "Category": "StructuralRead",
                                     "Direction": direction,
                                     "Phase": resolved_phase_name,
                                     "ObjectGroup": object_group,
@@ -2855,7 +3128,9 @@ def run_structural_moment_export(args, logger=print):
 
         raw_df = pd.DataFrame(raw_rows)
         if raw_df.empty:
-            raise RuntimeError("No structural moment data could be read for selected phases/objects.")
+            raise RuntimeError(
+                "No structural force/moment data could be read for selected phases/objects."
+            )
 
         raw_df = _apply_plate_group_merge(
             raw_df,
@@ -2881,6 +3156,10 @@ def run_structural_moment_export(args, logger=print):
                 Depth=("Depth", "mean"),
                 MPlus=("MPlus", "mean"),
                 MMinus=("MMinus", "mean"),
+                NPlus=("NPlus", "mean"),
+                NMinus=("NMinus", "mean"),
+                QPlus=("QPlus", "mean"),
+                QMinus=("QMinus", "mean"),
                 SampleCount=("Phase", "count"),
             )
             .sort_values(["Direction", "ObjectGroup", "ObjectName", "Depth"])
@@ -2890,17 +3169,26 @@ def run_structural_moment_export(args, logger=print):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plot_dir = _ensure_plot_dir(out_path)
         plot_files = []
-        for direction in ("X", "Y"):
-            for object_group in ("Pile", "PlateGroup1", "PlateGroup2"):
-                if avg_df[
-                    (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
-                ].empty:
-                    continue
-                png_path = plot_dir / f"moment_{direction}_{object_group}.png"
-                ok = _plot_moment_group(avg_df, direction, object_group, png_path, dpi=plot_dpi)
-                if ok:
-                    plot_files.append(str(png_path))
-                    logger(f"Chart -> {png_path}")
+        for component_key in ("M", "N", "Q"):
+            spec = _get_structural_component_spec(component_key)
+            for direction in ("X", "Y"):
+                for object_group in ("Pile", "PlateGroup1", "PlateGroup2"):
+                    if avg_df[
+                        (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
+                    ].empty:
+                        continue
+                    png_path = plot_dir / f"{spec['plot_prefix']}_{direction}_{object_group}.png"
+                    ok = _plot_structural_component_group(
+                        avg_df,
+                        direction,
+                        object_group,
+                        component_key,
+                        png_path,
+                        dpi=plot_dpi,
+                    )
+                    if ok:
+                        plot_files.append(str(png_path))
+                        logger(f"Chart -> {png_path}")
 
         for path_text in plot_files:
             status_rows.append(
@@ -2918,7 +3206,9 @@ def run_structural_moment_export(args, logger=print):
         phases_df = pd.DataFrame(phases_rows).drop_duplicates()
         selections_df = pd.DataFrame(selection_rows).drop_duplicates()
         status_df = pd.DataFrame(status_rows)
-        moment_wide_specs = _build_structural_moment_wide_specs(avg_df)
+        structural_wide_specs = []
+        for component_key in ("M", "N", "Q"):
+            structural_wide_specs.extend(_build_structural_component_wide_specs(avg_df, component_key))
 
         sheets = [
             ("Phases", phases_df),
@@ -2927,10 +3217,10 @@ def run_structural_moment_export(args, logger=print):
             ("MomentAvgByDir", avg_df),
             ("_Status", status_df),
         ]
-        for spec in moment_wide_specs:
+        for spec in structural_wide_specs:
             sheets.append((spec["sheet_name"], spec["frame"]))
         out_final = _write_multisheet_workbook(out_path, sheets, logger=logger)
-        _add_excel_line_charts(out_final, moment_wide_specs, logger=logger)
+        _add_excel_line_charts(out_final, structural_wide_specs, logger=logger)
         logger(f"OK -> {out_final}")
         logger(f"Charts -> {plot_dir}")
     finally:
