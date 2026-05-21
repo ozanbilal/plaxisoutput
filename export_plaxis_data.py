@@ -1772,6 +1772,70 @@ def _get_results_numeric(g_o, obj, phase, result_type_obj, location, context):
     return _safe_numeric_array(raw, context)
 
 
+def _get_results_numeric_any_location(g_o, obj, phase, result_type_obj, locations, context):
+    last_exc = None
+    for location in _unique_keep_order(locations):
+        try:
+            return _get_results_numeric(g_o, obj, phase, result_type_obj, location, context), location
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is None:
+        raise RuntimeError(f"{context}: no result locations provided.")
+    raise RuntimeError(f"{context}: {_error_text(last_exc)}")
+
+
+def _resolve_global_strain_coordinate_result_types(g_o, gamma_result_type_path):
+    prefixes = []
+    text = str(gamma_result_type_path or "").strip()
+    if "." in text:
+        prefixes.append(text.rsplit(".", 1)[0].strip())
+    if "Soil" not in prefixes:
+        prefixes.append("Soil")
+
+    last_exc = None
+    for prefix in _unique_keep_order(prefixes):
+        try:
+            x_rt = resolve_result_type(g_o, f"{prefix}.X")
+            y_rt = resolve_result_type(g_o, f"{prefix}.Y")
+            return x_rt, y_rt, f"{prefix}.X", f"{prefix}.Y"
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc is not None:
+        raise RuntimeError(
+            f"Coordinate result types could not be resolved from gamma result type '{gamma_result_type_path}': "
+            f"{_error_text(last_exc)}"
+        )
+    raise RuntimeError(
+        f"Coordinate result types could not be resolved from gamma result type '{gamma_result_type_path}'."
+    )
+
+
+def _max_finite_index(values, context):
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        raise RuntimeError(f"{context}: empty numeric array.")
+    mask = np.isfinite(arr)
+    if not mask.any():
+        raise RuntimeError(f"{context}: all values are NaN/non-finite.")
+    safe = np.where(mask, arr, -np.inf)
+    idx = int(np.argmax(safe))
+    return idx, float(arr[idx])
+
+
+def _xy_arrays_match(x_ref, y_ref, x_new, y_new, atol=1e-9, rtol=1e-9):
+    try:
+        return (
+            len(x_ref) == len(x_new)
+            and len(y_ref) == len(y_new)
+            and np.allclose(np.asarray(x_ref, dtype=float), np.asarray(x_new, dtype=float), atol=atol, rtol=rtol, equal_nan=True)
+            and np.allclose(np.asarray(y_ref, dtype=float), np.asarray(y_new, dtype=float), atol=atol, rtol=rtol, equal_nan=True)
+        )
+    except Exception:
+        return False
+
+
 def _first_attr(obj, names):
     for name in names:
         try:
@@ -1824,6 +1888,54 @@ def _resolve_structural_result_types(rt_group):
             "available": (max_rt is not None and min_rt is not None),
         }
     return resolved
+
+
+def _resolve_plate_displacement_result_types(rt_group):
+    candidates = {
+        "Ux": (
+            ["UxEnvelopeMax2D", "Ux_EnvelopeMax2D", "UxEnvelopeMax", "UxMax2D", "UxMax"],
+            ["UxEnvelopeMin2D", "Ux_EnvelopeMin2D", "UxEnvelopeMin", "UxMin2D", "UxMin"],
+        ),
+        "Uy": (
+            ["UyEnvelopeMax2D", "Uy_EnvelopeMax2D", "UyEnvelopeMax", "UyMax2D", "UyMax"],
+            ["UyEnvelopeMin2D", "Uy_EnvelopeMin2D", "UyEnvelopeMin", "UyMin2D", "UyMin"],
+        ),
+    }
+    resolved = {}
+    for key, (max_names, min_names) in candidates.items():
+        max_rt, max_name = _first_attr(rt_group, max_names)
+        min_rt, min_name = _first_attr(rt_group, min_names)
+        resolved[key] = {
+            "max": max_rt,
+            "min": min_rt,
+            "max_name": max_name,
+            "min_name": min_name,
+            "available": (max_rt is not None and min_rt is not None),
+        }
+    total_rt, total_name = _first_attr(
+        rt_group,
+        [
+            "UtotEnvelopeMax2D",
+            "Utot_EnvelopeMax2D",
+            "UtotEnvelopeMax",
+            "UTotalEnvelopeMax2D",
+            "UTotalEnvelopeMax",
+            "UEnvelopeMax2D",
+            "U_EnvelopeMax2D",
+            "UEnvelopeMax",
+            "UtotMax2D",
+            "UMax2D",
+            "UMax",
+        ],
+    )
+    return {
+        "Ux": resolved["Ux"],
+        "Uy": resolved["Uy"],
+        "UTotalMax": total_rt,
+        "UTotalMax_name": total_name,
+        "available": (resolved["Ux"]["available"] and resolved["Uy"]["available"]),
+        "total_available": total_rt is not None,
+    }
 
 
 def _find_geometry_phase(g_o):
@@ -2245,6 +2357,159 @@ def _build_structural_component_wide_specs(avg_df, component_key):
     return specs
 
 
+PLATE_DISPLACEMENT_SPECS = (
+    {
+        "key": "Ux",
+        "label": "Ux Envelope",
+        "plus_col": "UxPlus",
+        "minus_col": "UxMinus",
+        "sheet_prefix": "PlateDispWide_Ux",
+        "plot_prefix": "plate_disp_ux",
+        "chart_title": "Plate Ux Envelope-Profile Distance",
+        "y_axis_title": "Ux",
+        "pair": True,
+    },
+    {
+        "key": "Uy",
+        "label": "Uy Envelope",
+        "plus_col": "UyPlus",
+        "minus_col": "UyMinus",
+        "sheet_prefix": "PlateDispWide_Uy",
+        "plot_prefix": "plate_disp_uy",
+        "chart_title": "Plate Uy Envelope-Profile Distance",
+        "y_axis_title": "Uy",
+        "pair": True,
+    },
+    {
+        "key": "UTotal",
+        "label": "Total Displacement Envelope",
+        "value_col": "UTotalMax",
+        "sheet_prefix": "PlateDispWide_UTotal",
+        "plot_prefix": "plate_disp_total",
+        "chart_title": "Plate Total Displacement Envelope-Profile Distance",
+        "y_axis_title": "Total Displacement",
+        "pair": False,
+    },
+)
+
+
+def _get_plate_displacement_spec(component_key):
+    for spec in PLATE_DISPLACEMENT_SPECS:
+        if spec["key"] == component_key:
+            return spec
+    raise KeyError(f"Unknown plate displacement component: {component_key}")
+
+
+def _build_plate_displacement_wide_specs(avg_df):
+    if avg_df.empty:
+        return []
+
+    used_names = set(
+        [
+            sanitize_sheet_name("Phases"),
+            sanitize_sheet_name("Selections"),
+            sanitize_sheet_name("PlateDispRawLong"),
+            sanitize_sheet_name("PlateDispAvgByDir"),
+            sanitize_sheet_name("_Status"),
+        ]
+    )
+    specs = []
+    directions = sorted(avg_df["Direction"].dropna().unique().tolist())
+    for spec in PLATE_DISPLACEMENT_SPECS:
+        is_pair = bool(spec.get("pair"))
+        for direction in directions:
+            dir_df = avg_df[avg_df["Direction"] == direction].copy()
+            groups = sorted(dir_df["ObjectGroup"].dropna().unique().tolist())
+            for object_group in groups:
+                sub = dir_df[dir_df["ObjectGroup"] == object_group].copy()
+                if sub.empty:
+                    continue
+                frames = []
+                series_pairs = []
+                col_cursor = 1
+                object_names = sorted(sub["ObjectName"].dropna().unique().tolist())
+                for object_name in object_names:
+                    if is_pair:
+                        plus_col = spec["plus_col"]
+                        minus_col = spec["minus_col"]
+                        one = (
+                            sub[sub["ObjectName"] == object_name][["Depth", plus_col, minus_col]]
+                            .dropna(subset=["Depth"])
+                            .dropna(subset=[plus_col, minus_col], how="all")
+                            .sort_values("Depth")
+                            .reset_index(drop=True)
+                        )
+                    else:
+                        value_col = spec["value_col"]
+                        one = (
+                            sub[sub["ObjectName"] == object_name][["Depth", value_col]]
+                            .dropna(subset=["Depth", value_col], how="any")
+                            .sort_values("Depth")
+                            .reset_index(drop=True)
+                        )
+                    if one.empty:
+                        continue
+                    c_depth = f"{object_name}_Depth"
+                    if is_pair:
+                        c_plus = f"{object_name}_{plus_col}"
+                        c_minus = f"{object_name}_{minus_col}"
+                        one = one.rename(
+                            columns={"Depth": c_depth, plus_col: c_plus, minus_col: c_minus}
+                        )
+                        frames.append(one[[c_depth, c_plus, c_minus]])
+                        series_pairs.append(
+                            {
+                                "x_col": col_cursor,
+                                "y_col": col_cursor + 1,
+                                "title": c_plus,
+                            }
+                        )
+                        series_pairs.append(
+                            {
+                                "x_col": col_cursor,
+                                "y_col": col_cursor + 2,
+                                "title": c_minus,
+                            }
+                        )
+                        col_cursor += 3
+                    else:
+                        c_value = f"{object_name}_{value_col}"
+                        one = one.rename(columns={"Depth": c_depth, value_col: c_value})
+                        frames.append(one[[c_depth, c_value]])
+                        series_pairs.append(
+                            {
+                                "x_col": col_cursor,
+                                "y_col": col_cursor + 1,
+                                "title": c_value,
+                            }
+                        )
+                        col_cursor += 2
+
+                if not frames:
+                    continue
+
+                wide = pd.concat(frames, axis=1)
+                sheet_name = _unique_sheet_name(
+                    f"{spec['sheet_prefix']}_{direction}_{object_group}",
+                    used_names,
+                )
+                specs.append(
+                    {
+                        "sheet_name": sheet_name,
+                        "frame": wide,
+                        "chart_title": f"{direction} | {object_group} | {spec['chart_title']}",
+                        "x_axis_title": "Profile Distance (m)",
+                        "y_axis_title": spec["y_axis_title"],
+                        "chart_type": "scatter",
+                        "series_pairs": series_pairs,
+                        "chart_width": 18.5,
+                        "chart_height": 9.5,
+                    }
+                )
+
+    return specs
+
+
 def _add_excel_line_charts(workbook_path, chart_specs, logger=print):
     if not chart_specs:
         return
@@ -2459,6 +2724,77 @@ def _plot_structural_component_group(avg_df, direction, object_group, component_
     ax.set_xlabel(spec["y_axis_title"])
     ax.set_ylabel("Profile Distance (m)")
     ax.set_title(f"{direction} Direction | {object_group} | {spec['label']} Mean +/- Envelope")
+    ax.grid(True, alpha=0.25)
+    _apply_compact_legend(fig, ax)
+    fig.savefig(out_png, dpi=int(dpi))
+    plt.close(fig)
+    return True
+
+
+def _plot_plate_displacement_group(avg_df, direction, object_group, component_key, out_png, dpi=150):
+    subset = avg_df[
+        (avg_df["Direction"] == direction) & (avg_df["ObjectGroup"] == object_group)
+    ].copy()
+    if subset.empty:
+        return False
+
+    spec = _get_plate_displacement_spec(component_key)
+    is_pair = bool(spec.get("pair"))
+    if is_pair:
+        plus_col = spec["plus_col"]
+        minus_col = spec["minus_col"]
+        subset = subset.dropna(subset=["Depth"]).dropna(subset=[plus_col, minus_col], how="all")
+    else:
+        value_col = spec["value_col"]
+        subset = subset.dropna(subset=["Depth", value_col], how="any")
+    if subset.empty:
+        return False
+
+    plt = _mpl_pyplot()
+    fig, ax = plt.subplots(figsize=(10, 7))
+    names = sorted(subset["ObjectName"].dropna().unique().tolist())
+    cmap = plt.cm.get_cmap("tab20", max(len(names), 1))
+
+    for idx, name in enumerate(names):
+        one = subset[subset["ObjectName"] == name].sort_values("Depth")
+        if one.empty:
+            continue
+        color = cmap(idx % cmap.N)
+        label_name = _short_plot_label(name, max_len=28)
+        if is_pair:
+            if one[plus_col].notna().any():
+                ax.plot(
+                    one[plus_col],
+                    one["Depth"],
+                    color=color,
+                    linewidth=1.7,
+                    label=f"{label_name} {component_key}+",
+                )
+            if one[minus_col].notna().any():
+                ax.plot(
+                    one[minus_col],
+                    one["Depth"],
+                    color=color,
+                    linewidth=1.3,
+                    linestyle="--",
+                    label=f"{label_name} {component_key}-",
+                )
+        else:
+            ax.plot(
+                one[value_col],
+                one["Depth"],
+                color=color,
+                linewidth=1.6,
+                label=label_name,
+            )
+
+    if is_pair:
+        ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax.invert_yaxis()
+    ax.set_xlabel(spec["y_axis_title"])
+    ax.set_ylabel("Profile Distance (m)")
+    title_suffix = "Mean +/- Envelope" if is_pair else "Mean Envelope Max"
+    ax.set_title(f"{direction} Direction | {object_group} | {spec['label']} {title_suffix}")
     ax.grid(True, alpha=0.25)
     _apply_compact_legend(fig, ax)
     fig.savefig(out_png, dpi=int(dpi))
@@ -2908,6 +3244,42 @@ def _plot_node_selection_map(model_points, node_map_df, out_png, dpi=150):
     return True
 
 
+def _plot_global_max_strain_map(direction_df, direction, out_png, dpi=150):
+    if direction_df.empty:
+        return False
+
+    work = direction_df.copy()
+    work["X"] = pd.to_numeric(work["X"], errors="coerce")
+    work["Y"] = pd.to_numeric(work["Y"], errors="coerce")
+    work["GammaMaxAbs"] = pd.to_numeric(work["GammaMaxAbs"], errors="coerce")
+    work = work[np.isfinite(work["X"]) & np.isfinite(work["Y"]) & np.isfinite(work["GammaMaxAbs"])].copy()
+    if work.empty:
+        return False
+
+    plt = _mpl_pyplot()
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    scatter = ax.scatter(
+        work["X"],
+        work["Y"],
+        c=work["GammaMaxAbs"],
+        s=8,
+        cmap="turbo",
+        linewidths=0.0,
+        rasterized=True,
+    )
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_title(f"{direction} | Global Max Shear Strain Map | Governing Max")
+    ax.grid(True, alpha=0.18)
+    ax.set_aspect("equal", adjustable="box")
+    color_bar = fig.colorbar(scatter, ax=ax, pad=0.02)
+    color_bar.set_label("|Gamma_xy| max")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=int(dpi), bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
+    return True
+
+
 def _apply_plate_group_merge(raw_df, merge_group1=False, merge_group2=False):
     if raw_df.empty:
         return raw_df
@@ -3001,6 +3373,422 @@ def list_structural_objects_api(host, port, password):
         _safe_close_server(s_o)
 
 
+def run_global_max_strain_export(args, logger=print):
+    x_phase_names = list(getattr(args, "x_phase_names", []) or [])
+    y_phase_names = list(getattr(args, "y_phase_names", []) or [])
+    gamma_result_type_path = str(getattr(args, "gamma_result_type", "") or "").strip()
+    out_text = str(getattr(args, "out", "") or "").strip()
+    out_path = Path(out_text).expanduser()
+    plot_dpi = int(float(getattr(args, "plot_dpi", 150) or 150))
+
+    if not str(getattr(args, "password", "")).strip():
+        raise RuntimeError("Password is required.")
+    if not x_phase_names and not y_phase_names:
+        raise RuntimeError("Select at least one X or Y phase.")
+    if not gamma_result_type_path:
+        raise RuntimeError("Gamma result type is required.")
+    if not out_text:
+        raise RuntimeError("Output path is required.")
+
+    s_o, g_o = _open_output_server(args.host, int(args.port), args.password)
+    try:
+        _ensure_output_result_types(g_o)
+        _ensure_active_output_project(g_o)
+        gamma_result_type = resolve_result_type(g_o, gamma_result_type_path)
+        coord_x_rt, coord_y_rt, coord_x_path, coord_y_path = _resolve_global_strain_coordinate_result_types(
+            g_o, gamma_result_type_path
+        )
+        phase_map = _build_phase_alias_map(list(g_o.Phases))
+        location_candidates = ["stress point", "stresspoint"]
+
+        phases_rows = []
+        status_rows = []
+        phase_point_frames = []
+        phase_history_rows = []
+        phase_peak_rows = []
+        direction_peak_rows = []
+        direction_point_frames = []
+
+        direction_states = {"X": None, "Y": None}
+        phase_counter = 0
+        total_phase_count = len(x_phase_names) + len(y_phase_names)
+        logger(
+            f"Global max strain run started: phases={total_phase_count}, "
+            f"gamma={gamma_result_type_path}, coord_x={coord_x_path}, coord_y={coord_y_path}, "
+            f"plot_dpi={plot_dpi}"
+        )
+
+        for direction, phase_names in (("X", x_phase_names), ("Y", y_phase_names)):
+            for phase_name in phase_names:
+                phase_counter += 1
+                try:
+                    phase = _resolve_phase_by_name(phase_map, phase_name)
+                except Exception as exc:
+                    status_rows.append(
+                        {
+                            "Category": "PhaseResolve",
+                            "Direction": direction,
+                            "Phase": phase_name,
+                            "Status": "ERROR",
+                            "Message": _error_text(exc),
+                        }
+                    )
+                    continue
+
+                resolved_phase_name = _phase_display_name(phase)
+                phases_rows.append({"Direction": direction, "Phase": resolved_phase_name})
+                logger(f"[{phase_counter}/{total_phase_count}] {direction} phase: {resolved_phase_name}")
+
+                step_list = list(phase.Steps)
+                if not step_list:
+                    status_rows.append(
+                        {
+                            "Category": "PhaseSteps",
+                            "Direction": direction,
+                            "Phase": resolved_phase_name,
+                            "Status": "ERROR",
+                            "Message": "Phase has no steps.",
+                        }
+                    )
+                    continue
+
+                phase_t_values, _ = _resolve_phase_time_series(step_list)
+                phase_x = None
+                phase_y = None
+                phase_envelope = None
+                phase_step_idx = None
+                phase_time_vals = None
+                phase_point_index = None
+                reference_location = ""
+                valid_step_count = 0
+                init_error = None
+                phase_failed = False
+
+                for step_idx, step in enumerate(step_list, start=1):
+                    dynamic_time = float(phase_t_values[step_idx - 1]) if step_idx - 1 < len(phase_t_values) else float("nan")
+                    try:
+                        if phase_envelope is None:
+                            gamma_vals, resolved_location = _get_results_numeric_any_location(
+                                g_o,
+                                None,
+                                step,
+                                gamma_result_type,
+                                location_candidates,
+                                f"{direction}:{resolved_phase_name}:Gamma_xy",
+                            )
+                            x_vals = _get_results_numeric(
+                                g_o,
+                                None,
+                                step,
+                                coord_x_rt,
+                                resolved_location,
+                                f"{direction}:{resolved_phase_name}:X",
+                            )
+                            y_vals = _get_results_numeric(
+                                g_o,
+                                None,
+                                step,
+                                coord_y_rt,
+                                resolved_location,
+                                f"{direction}:{resolved_phase_name}:Y",
+                            )
+                            n_points = min(len(gamma_vals), len(x_vals), len(y_vals))
+                            if n_points <= 0:
+                                raise RuntimeError("No numeric stress-point field values.")
+                            gamma_vals = gamma_vals[:n_points]
+                            x_vals = x_vals[:n_points]
+                            y_vals = y_vals[:n_points]
+                            if len(gamma_vals) != len(x_vals) or len(gamma_vals) != len(y_vals):
+                                raise RuntimeError("Stress-point field lengths do not match for Gamma/X/Y.")
+                            phase_x = np.asarray(x_vals, dtype=float)
+                            phase_y = np.asarray(y_vals, dtype=float)
+                            phase_envelope = np.full(len(gamma_vals), -np.inf, dtype=float)
+                            phase_step_idx = np.zeros(len(gamma_vals), dtype=int)
+                            phase_time_vals = np.full(len(gamma_vals), np.nan, dtype=float)
+                            phase_point_index = np.arange(1, len(gamma_vals) + 1, dtype=int)
+                            reference_location = resolved_location
+                        else:
+                            gamma_vals = _get_results_numeric(
+                                g_o,
+                                None,
+                                step,
+                                gamma_result_type,
+                                reference_location,
+                                f"{direction}:{resolved_phase_name}:Gamma_xy",
+                            )
+                            if len(gamma_vals) != len(phase_envelope):
+                                raise RuntimeError(
+                                    f"Stress-point count changed within phase ({len(gamma_vals)} != {len(phase_envelope)})."
+                                )
+
+                        abs_gamma = np.abs(np.asarray(gamma_vals, dtype=float))
+                        if len(abs_gamma) != len(phase_envelope):
+                            raise RuntimeError(
+                                f"Stress-point count changed within phase ({len(abs_gamma)} != {len(phase_envelope)})."
+                            )
+                        if not np.isfinite(abs_gamma).any():
+                            raise RuntimeError("All Gamma_xy values are NaN/non-finite at this step.")
+
+                        update_mask = np.isfinite(abs_gamma) & (
+                            (~np.isfinite(phase_envelope)) | (abs_gamma > phase_envelope)
+                        )
+                        if np.any(update_mask):
+                            phase_envelope[update_mask] = abs_gamma[update_mask]
+                            phase_step_idx[update_mask] = int(step_idx)
+                            phase_time_vals[update_mask] = float(dynamic_time)
+
+                        max_idx, max_val = _max_finite_index(
+                            abs_gamma, f"{direction}:{resolved_phase_name}:global-step-max"
+                        )
+                        phase_history_rows.append(
+                            {
+                                "Direction": direction,
+                                "Phase": resolved_phase_name,
+                                "StepIndex": int(step_idx),
+                                "DynamicTime": float(dynamic_time),
+                                "PointIndex": int(max_idx + 1),
+                                "X": float(phase_x[max_idx]),
+                                "Y": float(phase_y[max_idx]),
+                                "GlobalMaxGammaAbs": float(max_val),
+                            }
+                        )
+                        valid_step_count += 1
+                    except Exception as exc:
+                        if phase_envelope is None:
+                            init_error = exc
+                            continue
+                        status_rows.append(
+                            {
+                                "Category": "PhaseRead",
+                                "Direction": direction,
+                                "Phase": resolved_phase_name,
+                                "Status": "ERROR",
+                                "Message": _error_text(exc),
+                            }
+                        )
+                        phase_failed = True
+                        logger(
+                            f"{direction} {resolved_phase_name} -> ERROR at step {step_idx}: {_error_text(exc)}"
+                        )
+                        break
+
+                if phase_envelope is None:
+                    status_rows.append(
+                        {
+                            "Category": "PhaseInit",
+                            "Direction": direction,
+                            "Phase": resolved_phase_name,
+                            "Status": "ERROR",
+                            "Message": _error_text(init_error or RuntimeError("No valid step field could be read.")),
+                        }
+                    )
+                    continue
+                if phase_failed:
+                    continue
+
+                phase_envelope = np.where(np.isfinite(phase_envelope), phase_envelope, np.nan)
+                if not np.isfinite(phase_envelope).any():
+                    status_rows.append(
+                        {
+                            "Category": "PhaseRead",
+                            "Direction": direction,
+                            "Phase": resolved_phase_name,
+                            "Status": "ERROR",
+                            "Message": "Phase envelope contains no finite Gamma_xy values.",
+                        }
+                    )
+                    continue
+
+                phase_point_frames.append(
+                    pd.DataFrame(
+                        {
+                            "Direction": direction,
+                            "Phase": resolved_phase_name,
+                            "PointIndex": phase_point_index.astype(int),
+                            "X": phase_x.astype(float),
+                            "Y": phase_y.astype(float),
+                            "GammaMaxAbs": phase_envelope.astype(float),
+                            "EnvelopeStep": phase_step_idx.astype(int),
+                            "EnvelopeDynamicTime": phase_time_vals.astype(float),
+                        }
+                    )
+                )
+
+                phase_peak_idx, phase_peak_val = _max_finite_index(
+                    phase_envelope, f"{direction}:{resolved_phase_name}:phase-max"
+                )
+                phase_peak_rows.append(
+                    {
+                        "Direction": direction,
+                        "Phase": resolved_phase_name,
+                        "PointIndex": int(phase_point_index[phase_peak_idx]),
+                        "X": float(phase_x[phase_peak_idx]),
+                        "Y": float(phase_y[phase_peak_idx]),
+                        "GammaMaxAbs": float(phase_peak_val),
+                        "EnvelopeStep": int(phase_step_idx[phase_peak_idx]),
+                        "EnvelopeDynamicTime": float(phase_time_vals[phase_peak_idx]),
+                        "PointCount": int(len(phase_envelope)),
+                        "ValidStepCount": int(valid_step_count),
+                        "ResultLocation": reference_location,
+                    }
+                )
+                status_rows.append(
+                    {
+                        "Category": "PhaseRead",
+                        "Direction": direction,
+                        "Phase": resolved_phase_name,
+                        "Status": "OK",
+                        "Message": (
+                            f"steps={valid_step_count}, points={len(phase_envelope)}, "
+                            f"location={reference_location}"
+                        ),
+                    }
+                )
+                logger(
+                    f"{direction} {resolved_phase_name} -> steps={valid_step_count}, "
+                    f"points={len(phase_envelope)}, location={reference_location}"
+                )
+
+                state = direction_states.get(direction)
+                if state is None:
+                    direction_states[direction] = {
+                        "x": phase_x.copy(),
+                        "y": phase_y.copy(),
+                        "point_index": phase_point_index.copy(),
+                        "gamma": phase_envelope.copy(),
+                        "phase": np.asarray([resolved_phase_name] * len(phase_envelope), dtype=object),
+                        "step": phase_step_idx.copy(),
+                        "time": phase_time_vals.copy(),
+                        "phase_count": 1,
+                    }
+                else:
+                    if not _xy_arrays_match(state["x"], state["y"], phase_x, phase_y):
+                        status_rows.append(
+                            {
+                                "Category": "PhaseCombine",
+                                "Direction": direction,
+                                "Phase": resolved_phase_name,
+                                "Status": "ERROR",
+                                "Message": "Coordinates/stress-point order differ from earlier phase in same direction.",
+                            }
+                        )
+                        logger(
+                            f"{direction} {resolved_phase_name} -> skipped from direction combine: "
+                            "coordinate/stress-point mismatch."
+                        )
+                        continue
+
+                    update_mask = np.isfinite(phase_envelope) & (
+                        (~np.isfinite(state["gamma"])) | (phase_envelope > state["gamma"])
+                    )
+                    if np.any(update_mask):
+                        state["gamma"][update_mask] = phase_envelope[update_mask]
+                        state["phase"][update_mask] = resolved_phase_name
+                        state["step"][update_mask] = phase_step_idx[update_mask]
+                        state["time"][update_mask] = phase_time_vals[update_mask]
+                    state["phase_count"] = int(state["phase_count"]) + 1
+
+        if not phase_point_frames:
+            raise RuntimeError(
+                "No max shear strain envelope data could be read for selected phases."
+            )
+
+        for direction, state in direction_states.items():
+            if state is None or not np.isfinite(state["gamma"]).any():
+                continue
+            dir_frame = pd.DataFrame(
+                {
+                    "Direction": direction,
+                    "PointIndex": state["point_index"].astype(int),
+                    "X": state["x"].astype(float),
+                    "Y": state["y"].astype(float),
+                    "GammaMaxAbs": np.asarray(state["gamma"], dtype=float),
+                    "GoverningPhase": state["phase"],
+                    "GoverningStep": np.asarray(state["step"], dtype=int),
+                    "GoverningDynamicTime": np.asarray(state["time"], dtype=float),
+                }
+            )
+            direction_point_frames.append(dir_frame)
+            dir_peak_idx, dir_peak_val = _max_finite_index(
+                state["gamma"], f"{direction}:direction-max"
+            )
+            direction_peak_rows.append(
+                {
+                    "Direction": direction,
+                    "PointIndex": int(state["point_index"][dir_peak_idx]),
+                    "X": float(state["x"][dir_peak_idx]),
+                    "Y": float(state["y"][dir_peak_idx]),
+                    "GammaMaxAbs": float(dir_peak_val),
+                    "GoverningPhase": str(state["phase"][dir_peak_idx]),
+                    "GoverningStep": int(state["step"][dir_peak_idx]),
+                    "GoverningDynamicTime": float(state["time"][dir_peak_idx]),
+                    "PhaseCount": int(state["phase_count"]),
+                }
+            )
+
+        point_envelope_phase_df = pd.concat(phase_point_frames, ignore_index=True)
+        point_envelope_dir_df = (
+            pd.concat(direction_point_frames, ignore_index=True)
+            if direction_point_frames
+            else pd.DataFrame(
+                columns=[
+                    "Direction",
+                    "PointIndex",
+                    "X",
+                    "Y",
+                    "GammaMaxAbs",
+                    "GoverningPhase",
+                    "GoverningStep",
+                    "GoverningDynamicTime",
+                ]
+            )
+        )
+        phase_global_history_df = pd.DataFrame(phase_history_rows)
+        phase_peak_summary_df = pd.DataFrame(phase_peak_rows)
+        direction_peak_summary_df = pd.DataFrame(direction_peak_rows)
+        phases_df = pd.DataFrame(phases_rows).drop_duplicates()
+        status_df = pd.DataFrame(status_rows)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plot_dir = _ensure_plot_dir(out_path)
+        chart_paths = []
+        for direction in ("X", "Y"):
+            one = point_envelope_dir_df[point_envelope_dir_df["Direction"] == direction].copy()
+            if one.empty:
+                continue
+            png_path = plot_dir / f"gamma_max_map_{direction}.png"
+            if _plot_global_max_strain_map(one, direction, png_path, dpi=plot_dpi):
+                chart_paths.append(str(png_path))
+                logger(f"Chart -> {png_path}")
+
+        for path_text in chart_paths:
+            status_rows.append(
+                {
+                    "Category": "Chart",
+                    "Direction": "",
+                    "Phase": "",
+                    "Status": "OK",
+                    "Message": path_text,
+                }
+            )
+        status_df = pd.DataFrame(status_rows)
+
+        sheets = [
+            ("Phases", phases_df),
+            ("PointEnvelopePhaseLong", point_envelope_phase_df),
+            ("PointEnvelopeByDir", point_envelope_dir_df),
+            ("PhaseGlobalMaxHistory", phase_global_history_df),
+            ("PhasePeakSummary", phase_peak_summary_df),
+            ("DirectionPeakSummary", direction_peak_summary_df),
+            ("_Status", status_df),
+        ]
+        out_final = _write_multisheet_workbook(out_path, sheets, logger=logger)
+        logger(f"OK -> {out_final}")
+        logger(f"Charts -> {plot_dir}")
+    finally:
+        _safe_close_server(s_o)
+
+
 def run_structural_moment_export(args, logger=print):
     x_phase_names = list(getattr(args, "x_phase_names", []) or [])
     y_phase_names = list(getattr(args, "y_phase_names", []) or [])
@@ -3060,11 +3848,19 @@ def run_structural_moment_export(args, logger=print):
         ]
         for group in selected_groups:
             group["resolved_components"] = _resolve_structural_result_types(group["rt_group"])
+            group["resolved_displacements"] = (
+                _resolve_plate_displacement_result_types(group["rt_group"])
+                if group["object_type"] == "Plate"
+                else {}
+            )
 
         phases_rows = []
         selection_rows = []
         status_rows = []
         raw_rows = []
+        disp_selection_rows = []
+        disp_status_rows = []
+        disp_raw_rows = []
 
         total_phase_count = len(x_phase_names) + len(y_phase_names)
         logger(
@@ -3088,6 +3884,23 @@ def run_structural_moment_export(args, logger=print):
                 )
                 logger(f"Warning: {message}")
                 status_rows.append(
+                    {
+                        "Category": "ResultTypeResolve",
+                        "Direction": "",
+                        "Phase": "",
+                        "ObjectGroup": group["object_group"],
+                        "ObjectName": "",
+                        "Status": "WARN",
+                        "Message": message,
+                    }
+                )
+            if group["object_type"] == "Plate" and not group["resolved_displacements"].get("available"):
+                message = (
+                    f"{group['object_group']} displacement envelope result types not found for Ux/Uy. "
+                    "Plate displacement envelope export will be skipped for this group."
+                )
+                logger(f"Warning: {message}")
+                disp_status_rows.append(
                     {
                         "Category": "ResultTypeResolve",
                         "Direction": "",
@@ -3134,6 +3947,14 @@ def run_structural_moment_export(args, logger=print):
                                 "ObjectName": object_name,
                             }
                         )
+                        if object_type == "Plate":
+                            disp_selection_rows.append(
+                                {
+                                    "SelectionType": object_group,
+                                    "ObjectType": object_type,
+                                    "ObjectName": object_name,
+                                }
+                            )
                         obj = obj_map.get(object_name)
                         if obj is None:
                             status_rows.append(
@@ -3147,6 +3968,18 @@ def run_structural_moment_export(args, logger=print):
                                     "Message": "Object not found in current Output session.",
                                 }
                             )
+                            if object_type == "Plate":
+                                disp_status_rows.append(
+                                    {
+                                        "Category": "ObjectResolve",
+                                        "Direction": direction,
+                                        "Phase": resolved_phase_name,
+                                        "ObjectGroup": object_group,
+                                        "ObjectName": object_name,
+                                        "Status": "ERROR",
+                                        "Message": "Object not found in current Output session.",
+                                    }
+                                )
                             continue
 
                         context = f"{direction}:{resolved_phase_name}:{object_group}:{object_name}"
@@ -3159,7 +3992,7 @@ def run_structural_moment_export(args, logger=print):
                             )
                             component_values = {}
                             component_names = []
-                            lengths = [len(x), len(y)]
+                            force_lengths = [len(x), len(y)]
                             for component_key in ("M", "N", "Q"):
                                 info = resolved_components.get(component_key, {})
                                 if not info.get("available"):
@@ -3183,23 +4016,23 @@ def run_structural_moment_export(args, logger=print):
                                 )
                                 component_values[component_key] = (plus_vals, minus_vals)
                                 component_names.append(component_key)
-                                lengths.extend([len(plus_vals), len(minus_vals)])
+                                force_lengths.extend([len(plus_vals), len(minus_vals)])
                             if not component_names:
                                 raise RuntimeError("No force/moment envelope result types available.")
-                            n = min(lengths) if lengths else 0
-                            if n == 0:
+                            n_force = min(force_lengths) if force_lengths else 0
+                            if n_force == 0:
                                 raise RuntimeError("No numeric node results.")
-                            x = x[:n]
-                            y = y[:n]
+                            x_force = x[:n_force]
+                            y_force = y[:n_force]
                             trimmed_components = {}
                             for component_key, pair in component_values.items():
                                 if pair[0] is None or pair[1] is None:
                                     trimmed_components[component_key] = (np.nan, np.nan)
                                     continue
-                                trimmed_components[component_key] = (pair[0][:n], pair[1][:n])
-                            depth = _profile_distance_from_xy(x, y)
+                                trimmed_components[component_key] = (pair[0][:n_force], pair[1][:n_force])
+                            depth_force = _profile_distance_from_xy(x_force, y_force)
 
-                            for i in range(n):
+                            for i in range(n_force):
                                 m_plus, m_minus = trimmed_components["M"]
                                 n_plus, n_minus = trimmed_components["N"]
                                 q_plus, q_minus = trimmed_components["Q"]
@@ -3210,9 +4043,9 @@ def run_structural_moment_export(args, logger=print):
                                         "ObjectGroup": object_group,
                                         "ObjectType": object_type,
                                         "ObjectName": object_name,
-                                        "X": float(x[i]),
-                                        "Y": float(y[i]),
-                                        "Depth": float(depth[i]),
+                                        "X": float(x_force[i]),
+                                        "Y": float(y_force[i]),
+                                        "Depth": float(depth_force[i]),
                                         "MPlus": float(m_plus[i]) if np.ndim(m_plus) else np.nan,
                                         "MMinus": float(m_minus[i]) if np.ndim(m_minus) else np.nan,
                                         "NPlus": float(n_plus[i]) if np.ndim(n_plus) else np.nan,
@@ -3229,18 +4062,148 @@ def run_structural_moment_export(args, logger=print):
                                     "ObjectGroup": object_group,
                                     "ObjectName": object_name,
                                     "Status": "OK",
-                                    "Message": f"{n} points | components={','.join(component_names) or 'none'}",
+                                    "Message": f"{n_force} points | components={','.join(component_names) or 'none'}",
                                 }
                             )
                             logger(
                                 f"{direction} {resolved_phase_name} | "
-                                f"{object_group}:{object_name} -> {n} points | "
+                                f"{object_group}:{object_name} -> {n_force} points | "
                                 f"components={','.join(component_names) or 'none'}"
                             )
                         except Exception as exc:
                             status_rows.append(
                                 {
                                     "Category": "StructuralRead",
+                                    "Direction": direction,
+                                    "Phase": resolved_phase_name,
+                                    "ObjectGroup": object_group,
+                                    "ObjectName": object_name,
+                                    "Status": "ERROR",
+                                    "Message": _error_text(exc),
+                                }
+                            )
+                            continue
+
+                        if object_type != "Plate":
+                            continue
+
+                        disp_info = group.get("resolved_displacements", {})
+                        if not disp_info.get("available"):
+                            continue
+
+                        try:
+                            ux_plus_vals = _get_results_numeric(
+                                g_o,
+                                obj,
+                                phase,
+                                disp_info["Ux"]["max"],
+                                "node",
+                                f"{context}:Ux+",
+                            )
+                            ux_minus_vals = _get_results_numeric(
+                                g_o,
+                                obj,
+                                phase,
+                                disp_info["Ux"]["min"],
+                                "node",
+                                f"{context}:Ux-",
+                            )
+                            uy_plus_vals = _get_results_numeric(
+                                g_o,
+                                obj,
+                                phase,
+                                disp_info["Uy"]["max"],
+                                "node",
+                                f"{context}:Uy+",
+                            )
+                            uy_minus_vals = _get_results_numeric(
+                                g_o,
+                                obj,
+                                phase,
+                                disp_info["Uy"]["min"],
+                                "node",
+                                f"{context}:Uy-",
+                            )
+                            total_max_vals = None
+                            if disp_info.get("total_available") and disp_info.get("UTotalMax") is not None:
+                                total_max_vals = _get_results_numeric(
+                                    g_o,
+                                    obj,
+                                    phase,
+                                    disp_info["UTotalMax"],
+                                    "node",
+                                    f"{context}:UTotalMax",
+                                )
+
+                            lengths = [
+                                len(x),
+                                len(y),
+                                len(ux_plus_vals),
+                                len(ux_minus_vals),
+                                len(uy_plus_vals),
+                                len(uy_minus_vals),
+                            ]
+                            if total_max_vals is not None:
+                                lengths.append(len(total_max_vals))
+                            n_disp = min(lengths)
+                            if n_disp <= 0:
+                                raise RuntimeError("No numeric displacement envelope node results.")
+                            x_disp = x[:n_disp]
+                            y_disp = y[:n_disp]
+                            ux_plus_vals = ux_plus_vals[:n_disp]
+                            ux_minus_vals = ux_minus_vals[:n_disp]
+                            uy_plus_vals = uy_plus_vals[:n_disp]
+                            uy_minus_vals = uy_minus_vals[:n_disp]
+                            if total_max_vals is not None:
+                                utotal_vals = total_max_vals[:n_disp]
+                                total_source = "direct"
+                            else:
+                                ux_abs = np.maximum(np.abs(ux_plus_vals), np.abs(ux_minus_vals))
+                                uy_abs = np.maximum(np.abs(uy_plus_vals), np.abs(uy_minus_vals))
+                                utotal_vals = np.hypot(ux_abs, uy_abs)
+                                total_source = "derived"
+                            depth_disp = _profile_distance_from_xy(x_disp, y_disp)
+                            for i in range(n_disp):
+                                disp_raw_rows.append(
+                                    {
+                                        "Direction": direction,
+                                        "Phase": resolved_phase_name,
+                                        "ObjectGroup": object_group,
+                                        "ObjectType": object_type,
+                                        "ObjectName": object_name,
+                                        "X": float(x_disp[i]),
+                                        "Y": float(y_disp[i]),
+                                        "Depth": float(depth_disp[i]),
+                                        "UxPlus": float(ux_plus_vals[i]),
+                                        "UxMinus": float(ux_minus_vals[i]),
+                                        "UyPlus": float(uy_plus_vals[i]),
+                                        "UyMinus": float(uy_minus_vals[i]),
+                                        "UTotalMax": float(utotal_vals[i]),
+                                    }
+                                )
+                            disp_status_rows.append(
+                                {
+                                    "Category": "PlateDispRead",
+                                    "Direction": direction,
+                                    "Phase": resolved_phase_name,
+                                    "ObjectGroup": object_group,
+                                    "ObjectName": object_name,
+                                    "Status": "OK",
+                                    "Message": (
+                                        f"{n_disp} points | components=Ux+/Ux-/Uy+/Uy-/UTotalMax "
+                                        f"(total={total_source})"
+                                    ),
+                                }
+                            )
+                            logger(
+                                f"{direction} {resolved_phase_name} | "
+                                f"{object_group}:{object_name} -> {n_disp} displacement envelope points "
+                                f"(total={total_source})"
+                            )
+                        except Exception as exc:
+                            disp_status_rows.append(
+                                {
+                                    "Category": "PlateDispRead",
                                     "Direction": direction,
                                     "Phase": resolved_phase_name,
                                     "ObjectGroup": object_group,
@@ -3347,6 +4310,130 @@ def run_structural_moment_export(args, logger=print):
         _add_excel_line_charts(out_final, structural_wide_specs, logger=logger)
         logger(f"OK -> {out_final}")
         logger(f"Charts -> {plot_dir}")
+
+        plate_disp_groups_selected = bool(plate_group1 or plate_group2)
+        if plate_disp_groups_selected:
+            disp_out_path = _derive_output_with_suffix(out_path, "disp")
+            disp_out_path.parent.mkdir(parents=True, exist_ok=True)
+            disp_plot_dir = _ensure_plot_dir(disp_out_path)
+            disp_raw_df = pd.DataFrame(
+                disp_raw_rows,
+                columns=[
+                    "Direction",
+                    "Phase",
+                    "ObjectGroup",
+                    "ObjectType",
+                    "ObjectName",
+                    "X",
+                    "Y",
+                    "Depth",
+                    "UxPlus",
+                    "UxMinus",
+                    "UyPlus",
+                    "UyMinus",
+                    "UTotalMax",
+                ],
+            )
+            if not disp_raw_df.empty:
+                disp_raw_df = _apply_plate_group_merge(
+                    disp_raw_df,
+                    merge_group1=merge_plate_group1,
+                    merge_group2=merge_plate_group2,
+                )
+                disp_raw_df = disp_raw_df.sort_values(
+                    ["Direction", "ObjectGroup", "ObjectName", "Phase", "Depth"]
+                ).reset_index(drop=True)
+                disp_work = disp_raw_df.copy()
+                disp_work["DepthRound"] = disp_work["Depth"].round(6)
+                disp_avg_df = (
+                    disp_work.groupby(
+                        ["Direction", "ObjectGroup", "ObjectType", "ObjectName", "DepthRound"],
+                        as_index=False,
+                    )
+                    .agg(
+                        Depth=("Depth", "mean"),
+                        UxPlus=("UxPlus", "mean"),
+                        UxMinus=("UxMinus", "mean"),
+                        UyPlus=("UyPlus", "mean"),
+                        UyMinus=("UyMinus", "mean"),
+                        UTotalMax=("UTotalMax", "mean"),
+                        SampleCount=("Phase", "count"),
+                    )
+                    .sort_values(["Direction", "ObjectGroup", "ObjectName", "Depth"])
+                    .reset_index(drop=True)
+                )
+            else:
+                disp_avg_df = pd.DataFrame(
+                    columns=[
+                        "Direction",
+                        "ObjectGroup",
+                        "ObjectType",
+                        "ObjectName",
+                        "DepthRound",
+                        "Depth",
+                        "UxPlus",
+                        "UxMinus",
+                        "UyPlus",
+                        "UyMinus",
+                        "UTotalMax",
+                        "SampleCount",
+                    ]
+                )
+
+            disp_plot_files = []
+            for component_key in ("Ux", "Uy", "UTotal"):
+                spec = _get_plate_displacement_spec(component_key)
+                for direction in ("X", "Y"):
+                    for object_group in ("PlateGroup1", "PlateGroup2"):
+                        if disp_avg_df[
+                            (disp_avg_df["Direction"] == direction)
+                            & (disp_avg_df["ObjectGroup"] == object_group)
+                        ].empty:
+                            continue
+                        png_path = (
+                            disp_plot_dir / f"{spec['plot_prefix']}_{direction}_{object_group}.png"
+                        )
+                        ok = _plot_plate_displacement_group(
+                            disp_avg_df,
+                            direction,
+                            object_group,
+                            component_key,
+                            png_path,
+                            dpi=plot_dpi,
+                        )
+                        if ok:
+                            disp_plot_files.append(str(png_path))
+                            logger(f"Chart -> {png_path}")
+
+            for path_text in disp_plot_files:
+                disp_status_rows.append(
+                    {
+                        "Category": "Chart",
+                        "Direction": "",
+                        "Phase": "",
+                        "ObjectGroup": "",
+                        "ObjectName": "",
+                        "Status": "OK",
+                        "Message": path_text,
+                    }
+                )
+
+            disp_selection_df = pd.DataFrame(disp_selection_rows).drop_duplicates()
+            disp_status_df = pd.DataFrame(disp_status_rows)
+            disp_wide_specs = _build_plate_displacement_wide_specs(disp_avg_df)
+            disp_sheets = [
+                ("Phases", phases_df),
+                ("Selections", disp_selection_df),
+                ("PlateDispRawLong", disp_raw_df),
+                ("PlateDispAvgByDir", disp_avg_df),
+                ("_Status", disp_status_df),
+            ]
+            for spec in disp_wide_specs:
+                disp_sheets.append((spec["sheet_name"], spec["frame"]))
+            disp_out_final = _write_multisheet_workbook(disp_out_path, disp_sheets, logger=logger)
+            _add_excel_line_charts(disp_out_final, disp_wide_specs, logger=logger)
+            logger(f"OK -> {disp_out_final}")
+            logger(f"Charts -> {disp_plot_dir}")
     finally:
         _safe_close_server(s_o)
 

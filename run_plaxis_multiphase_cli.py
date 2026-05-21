@@ -292,6 +292,37 @@ def run_structural_mode(args):
     )
 
 
+def run_max_strain_mode(args):
+    password = _resolve_password(args.password)
+    phases, x_names, y_names = _phase_lists(
+        args.host,
+        args.port,
+        password,
+        args.x_regex,
+        args.y_regex,
+    )
+    _log(f"Loaded phases: total={len(phases)} x={len(x_names)} y={len(y_names)}")
+    if not x_names and not y_names:
+        raise RuntimeError("No phases matched x/y regex.")
+
+    run_args = SimpleNamespace(
+        host=args.host,
+        port=args.port,
+        password=password,
+        x_phase_names=x_names,
+        y_phase_names=y_names,
+        gamma_result_type=args.gamma_result_type,
+        plot_dpi=int(args.plot_dpi),
+        out=args.out,
+    )
+
+    _run_with_retry(
+        lambda: core.run_global_max_strain_export(run_args, logger=_log),
+        attempts=args.attempts,
+        sleep_sec=args.retry_sleep,
+    )
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Run PLAXIS multi-phase exports from terminal with retry."
@@ -361,6 +392,10 @@ def build_parser():
         action="store_true",
         help="Treat selected Plate Group 2 elements as a single merged profile.",
     )
+
+    gm = sub.add_parser("max-strain-map", help="Run global max shear strain envelope export.")
+    add_common(gm)
+    gm.add_argument("--gamma-result-type", default="Soil.Gamxy")
     return p
 
 
@@ -374,6 +409,8 @@ def main():
             run_stress_strain_mode(args)
         elif args.mode == "structural":
             run_structural_mode(args)
+        elif args.mode == "max-strain-map":
+            run_max_strain_mode(args)
         else:
             raise RuntimeError(f"Unknown mode: {args.mode}")
     except KeyboardInterrupt:
