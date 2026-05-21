@@ -2112,6 +2112,67 @@ def _export_node_timehistory_subfolders(time_df, base_out_path, time_col, logger
     return written_paths
 
 
+def _build_node_timehistory_wide_sheets(time_df, time_col):
+    if time_df.empty:
+        return []
+
+    required = {"Direction", "Phase", "Series", "Step", time_col, "Acceleration"}
+    missing = required.difference(time_df.columns)
+    if missing:
+        raise RuntimeError(
+            "Cannot build wide node time history sheets; missing columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    sheets = []
+    used_names = set(
+        [
+            sanitize_sheet_name("Phases"),
+            sanitize_sheet_name("Selections"),
+            sanitize_sheet_name("NodeMap"),
+            sanitize_sheet_name("NodeSpectrumLong"),
+            sanitize_sheet_name("NodeSpectrumMean"),
+            sanitize_sheet_name("_Status"),
+        ]
+    )
+    keys = (
+        time_df[["Direction", "Phase"]]
+        .drop_duplicates()
+        .sort_values(["Direction", "Phase"])
+        .itertuples(index=False)
+    )
+    for direction, phase in keys:
+        one = time_df[(time_df["Direction"] == direction) & (time_df["Phase"] == phase)].copy()
+        if one.empty:
+            continue
+
+        base = (
+            one.groupby("Step", as_index=False)
+            .agg(**{time_col: (time_col, "first")})
+            .sort_values("Step")
+            .reset_index(drop=True)
+        )
+        wide = (
+            one.pivot_table(
+                index="Step",
+                columns="Series",
+                values="Acceleration",
+                aggfunc="mean",
+            )
+            .sort_index()
+            .reset_index()
+        )
+        wide = base.merge(wide, on="Step", how="left")
+        series_cols = sorted([c for c in wide.columns if c not in ("Step", time_col)])
+        wide = wide[["Step", time_col] + series_cols]
+
+        phase_label = safe_label(_phase_short_name(phase) or phase)
+        sheet_name = _unique_sheet_name(f"NodeTH_{direction}_{phase_label}", used_names)
+        sheets.append((sheet_name, wide))
+
+    return sheets
+
+
 def _build_node_spectrum_wide_specs(spectrum_long_df, spectrum_mean_df):
     if spectrum_long_df.empty:
         return []
@@ -4897,16 +4958,33 @@ def run_node_multiphase_spectrum_export(args, logger=print):
             spectrum_long_df,
             spectrum_mean_df,
         )
+        timehistory_wide_sheets = _build_node_timehistory_wide_sheets(time_df, time_col)
+        if timehistory_wide_sheets:
+            status_rows.append(
+                {
+                    "Category": "Workbook",
+                    "Direction": "",
+                    "Phase": "",
+                    "Series": "",
+                    "CurvePointId": "",
+                    "Status": "OK",
+                    "Message": (
+                        "Node time histories written in wide per-phase sheets "
+                        f"({len(timehistory_wide_sheets)} sheets)."
+                    ),
+                }
+            )
+            status_df = pd.DataFrame(status_rows)
 
         sheets = [
             ("Phases", phases_df),
             ("Selections", selections_df),
             ("NodeMap", node_map_df),
-            ("NodeTimeHistoryLong", time_df),
             ("NodeSpectrumLong", spectrum_long_df),
             ("NodeSpectrumMean", spectrum_mean_df),
             ("_Status", status_df),
         ]
+        sheets.extend(timehistory_wide_sheets)
         for spec in spectrum_wide_specs:
             sheets.append((spec["sheet_name"], spec["frame"]))
         out_final = _write_multisheet_workbook(out_path, sheets, logger=logger)

@@ -201,7 +201,7 @@ Typical sheets:
 
 - `Phases`
 - `Selections`
-- `NodeTimeHistoryLong`
+- `NodeTH_*`
 - `NodeSpectrumLong`
 - `NodeSpectrumMean`
 - `Spec_*`
@@ -209,7 +209,7 @@ Typical sheets:
 - `SpecMean_*`
 - `_Status`
 
-For wide spectrum sheets, the first column is `Period_s` and the following columns are phase-based response values. Excel charts are written into the workbook as native charts, not just linked images.
+`NodeTH_*` sheets are written per phase in wide format: `Step` and time columns first, then one acceleration column per selected node. For wide spectrum sheets, the first column is `Period_s` and the following columns are phase-based response values. Excel charts are written into the workbook as native charts, not just linked images.
 
 ## Plot and Excel behavior
 
@@ -218,7 +218,7 @@ For wide spectrum sheets, the first column is `Period_s` and the following colum
 - Structural charts are written from aligned x-y data blocks rather than sparse mixed columns
 - Node and structural plots are exported both as workbook charts and as PNG files
 - Long sheets that exceed Excel's row limit are automatically split into numbered sheets,
-  for example `NodeTimeHistoryLong_01`, `NodeTimeHistoryLong_02`, and so on.
+  for example `NodeSpectrumLong_01`, `NodeSpectrumLong_02`, and so on.
 
 ## Public API functions
 
