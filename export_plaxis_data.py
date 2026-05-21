@@ -429,24 +429,169 @@ def _nodes_from_combobox(points_window, combo_index, wait_sec):
         if handle in used_handles:
             continue
         used_handles.add(handle)
+        expanded = False
         try:
             combo.wait("exists enabled", timeout=2)
             combo.expand()
+            expanded = True
             time.sleep(max(0.1, wait_sec))
-            items = combo.descendants(control_type="ListItem")
-            raw_names = [it.window_text().strip() for it in items if it.window_text().strip()]
-            node_names = []
-            for raw_name in raw_names:
-                node_name = _match_node_name(raw_name)
-                if node_name:
-                    node_names.append(node_name)
-            # Strict mode: ignore comboboxes that do not contain node labels
-            # (for example top phase/step combobox).
-            names.extend(node_names)
-            combo.collapse()
+            names.extend(_collect_combobox_node_names(combo, wait_sec))
+        except RuntimeError as exc:
+            if "focus/rewind combobox" in str(exc):
+                raise
+            continue
         except Exception:
             continue
+        finally:
+            if expanded:
+                try:
+                    combo.collapse()
+                except Exception:
+                    pass
     return _unique_keep_order(names)
+
+
+def _combobox_visible_texts(combo):
+    try:
+        items = combo.descendants(control_type="ListItem")
+    except Exception:
+        return []
+    texts = []
+    for item in items:
+        try:
+            text = item.window_text().strip()
+        except Exception:
+            continue
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _send_combobox_key(combo, key):
+    focused = False
+    try:
+        combo.set_focus()
+        focused = True
+    except Exception:
+        pass
+    try:
+        combo.type_keys(key, set_foreground=True)
+        return True
+    except Exception:
+        if not focused:
+            return False
+        try:
+            from pywinauto.keyboard import send_keys
+
+            send_keys(key)
+            return True
+        except Exception:
+            return False
+
+
+def _collect_combobox_node_names(combo, wait_sec, max_scroll_steps=1000):
+    # UI Automation often exposes only the visible dropdown page. Walk the
+    # dropdown until PageDown no longer changes the visible item window.
+    initial_names = []
+    for text in _combobox_visible_texts(combo):
+        node_name = _match_node_name(text)
+        if node_name:
+            initial_names.append(node_name)
+    if not initial_names:
+        return []
+
+    if not _send_combobox_key(combo, "{HOME}"):
+        raise RuntimeError("Could not focus/rewind combobox before node scan.")
+    scroll_wait = min(max(0.02, wait_sec), 0.1)
+    time.sleep(scroll_wait)
+
+    names = []
+    last_signature = None
+    stagnant_pages = 0
+    no_new_pages = 0
+    for _ in range(max_scroll_steps):
+        visible_texts = _combobox_visible_texts(combo)
+        signature = tuple(visible_texts)
+        before_count = len(names)
+        for raw_name in visible_texts:
+            node_name = _match_node_name(raw_name)
+            if node_name:
+                names.append(node_name)
+        names = _unique_keep_order(names)
+
+        if signature == last_signature:
+            stagnant_pages += 1
+        else:
+            stagnant_pages = 0
+        if len(names) == before_count:
+            no_new_pages += 1
+        else:
+            no_new_pages = 0
+        if stagnant_pages >= 2 or no_new_pages >= 3:
+            break
+        last_signature = signature
+
+        if not _send_combobox_key(combo, "{PGDN}"):
+            break
+        time.sleep(scroll_wait)
+
+    return names
+
+
+def _select_combobox_node_by_scroll(combo, node_name, wait_sec, max_scroll_steps=1000):
+    target_num = _node_number(node_name)
+    scroll_wait = min(max(0.02, wait_sec), 0.1)
+    expanded = False
+    last_signature = None
+    stagnant_pages = 0
+    no_match_pages = 0
+    try:
+        combo.expand()
+        expanded = True
+        time.sleep(scroll_wait)
+        if not _send_combobox_key(combo, "{HOME}"):
+            raise RuntimeError("Could not focus/rewind combobox before node selection.")
+        time.sleep(scroll_wait)
+
+        for _ in range(max_scroll_steps):
+            items = combo.descendants(control_type="ListItem")
+            visible_texts = []
+            for item in items:
+                try:
+                    text = item.window_text().strip()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                visible_texts.append(text)
+                if (target_num and _node_number(text) == target_num) or text == node_name:
+                    try:
+                        item.click_input()
+                    except Exception:
+                        combo.select(text)
+                    return "combobox:number-match-scroll"
+
+            signature = tuple(visible_texts)
+            if signature == last_signature:
+                stagnant_pages += 1
+            else:
+                stagnant_pages = 0
+            no_match_pages += 1
+            if stagnant_pages >= 2 or no_match_pages >= max_scroll_steps:
+                break
+            last_signature = signature
+
+            if not _send_combobox_key(combo, "{PGDN}"):
+                break
+            time.sleep(scroll_wait)
+    finally:
+        if expanded:
+            try:
+                combo.collapse()
+            except Exception:
+                pass
+
+    raise RuntimeError(f"Node '{node_name}' not found in combobox.")
 
 
 def _nodes_from_descendants(points_window):
@@ -523,33 +668,17 @@ def _get_node_tabitems(points_window):
     return tabs_by_num
 
 
-def _build_node_selector(points_window, combo_index):
+def _build_node_selector(points_window, combo_index, wait_sec=0.12):
     # Fast path 1: classic node combobox.
     try:
         combo = _get_points_combobox(points_window, combo_index)
 
         def select_from_combo(node_name):
-            target_num = _node_number(node_name)
             try:
                 combo.select(node_name)
                 return "combobox"
             except Exception:
-                if not target_num:
-                    raise
-                combo.expand()
-                time.sleep(0.12)
-                items = combo.descendants(control_type="ListItem")
-                for item in items:
-                    text = item.window_text().strip()
-                    if _node_number(text) == target_num:
-                        try:
-                            item.click_input()
-                        except Exception:
-                            combo.select(text)
-                        combo.collapse()
-                        return "combobox:number-match"
-                combo.collapse()
-                raise RuntimeError(f"Node '{node_name}' not found in combobox.")
+                return _select_combobox_node_by_scroll(combo, node_name, wait_sec)
 
         return "combobox", select_from_combo
     except Exception:
@@ -571,11 +700,11 @@ def _build_node_selector(points_window, combo_index):
 
     # Fallback: generic slow search.
     return "fallback", lambda node_name: _select_node_in_points_window(
-        points_window, node_name, combo_index
+        points_window, node_name, combo_index, wait_sec
     )
 
 
-def _select_node_in_points_window(points_window, node_name, combo_index):
+def _select_node_in_points_window(points_window, node_name, combo_index, wait_sec=0.15):
     target_num = _node_number(node_name)
 
     # Preferred path: select node from the node combobox (classic Points dialog).
@@ -586,19 +715,10 @@ def _select_node_in_points_window(points_window, node_name, combo_index):
             return "combobox"
         except Exception:
             if target_num:
-                combo.expand()
-                time.sleep(0.15)
-                items = combo.descendants(control_type="ListItem")
-                for item in items:
-                    text = item.window_text().strip()
-                    if _node_number(text) == target_num:
-                        try:
-                            item.click_input()
-                        except Exception:
-                            combo.select(text)
-                        combo.collapse()
-                        return "combobox:number-match"
-                combo.collapse()
+                try:
+                    return _select_combobox_node_by_scroll(combo, node_name, wait_sec)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -782,7 +902,11 @@ def run_spectrum_gui(args, logger=print):
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    selector_mode, select_node = _build_node_selector(points_window, args.combo_index)
+    selector_mode, select_node = _build_node_selector(
+        points_window,
+        args.combo_index,
+        args.wait,
+    )
     logger(f"Node selector mode: {selector_mode}")
 
     merged = None

@@ -84,6 +84,8 @@ Notes:
 
 - `pywinauto` is only needed for legacy GUI-copy helper code that still exists in the repository.
 - The main structural and node export workflows use the Output API.
+- The legacy `spectrum-gui` helper walks the PLAXIS Points combobox by scrolling
+  the dropdown, so it is not limited to the first visible page of node names.
 
 ## GUI usage
 
@@ -115,6 +117,9 @@ python plaxis_export_gui.py
   - Treats the selected plate group as one continuous profile
 - `Save node time histories into phase subfolders`
   - Writes CSV time histories under a folder next to the node workbook
+- `Load CurvePoints`
+  - Inserts every CurvePoint returned by the Output API into the node list.
+    The list height is only a visible-row setting; it is not a selection/export limit.
 
 Example time-history folder layout:
 

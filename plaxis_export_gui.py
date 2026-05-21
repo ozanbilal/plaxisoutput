@@ -352,7 +352,7 @@ class PlaxisExportApp(tk.Tk):
         clear_nodes_btn.pack(side="left")
         self.busy_widgets.extend([load_nodes_btn, sel_all_nodes_btn, clear_nodes_btn])
 
-        self.api_nodes_list = tk.Listbox(nodes, selectmode="extended", height=8)
+        self.api_nodes_list = tk.Listbox(nodes, selectmode="extended", height=14)
         self.api_nodes_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._style_listbox(self.api_nodes_list)
         self._attach_vertical_scrollbar(nodes, self.api_nodes_list, row=1, column=1)
