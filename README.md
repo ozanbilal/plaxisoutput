@@ -217,6 +217,8 @@ For wide spectrum sheets, the first column is `Period_s` and the following colum
 - Excel charts use numeric axes with automatic axis scaling
 - Structural charts are written from aligned x-y data blocks rather than sparse mixed columns
 - Node and structural plots are exported both as workbook charts and as PNG files
+- Long sheets that exceed Excel's row limit are automatically split into numbered sheets,
+  for example `NodeTimeHistoryLong_01`, `NodeTimeHistoryLong_02`, and so on.
 
 ## Public API functions
 

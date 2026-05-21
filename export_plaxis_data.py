@@ -8,6 +8,11 @@ import numpy as np
 import pandas as pd
 
 
+EXCEL_MAX_ROWS = 1048576
+EXCEL_MAX_COLS = 16384
+EXCEL_DATA_ROWS_PER_SHEET = EXCEL_MAX_ROWS - 1
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Export PLAXIS spectrum table or node time history to file."
@@ -296,7 +301,7 @@ def _save_csv_with_fallback(df, out_path, logger=None, max_versions=30):
 def _write_single_sheet_xlsx_with_fallback(df, out_path, sheet_name, logger=None):
     writer, out_path_final = _open_excel_writer_with_fallback(out_path, logger=logger)
     with writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        _write_dataframe_excel_sheet(writer, df, sheet_name, logger=logger)
     return out_path_final
 
 
@@ -339,6 +344,45 @@ def _unique_sheet_name(base_name, used_names):
             used_names.add(alt)
             return alt
     raise RuntimeError(f"Could not allocate unique sheet name for '{base_name}'.")
+
+
+def _chunked_sheet_base_name(sheet_name, part_index):
+    suffix = f"_{part_index:02d}"
+    clean = sanitize_sheet_name(sheet_name)
+    return f"{clean[: max(1, 31 - len(suffix))]}{suffix}"
+
+
+def _write_dataframe_excel_sheet(writer, df, sheet_name, logger=None, used_names=None):
+    frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    rows, cols = frame.shape
+    if cols > EXCEL_MAX_COLS:
+        raise RuntimeError(
+            f"Sheet '{sheet_name}' is too wide for Excel: {cols} columns. "
+            f"Maximum is {EXCEL_MAX_COLS}."
+        )
+
+    used = used_names if used_names is not None else set()
+    if rows <= EXCEL_DATA_ROWS_PER_SHEET:
+        actual_sheet = _unique_sheet_name(sheet_name, used)
+        frame.to_excel(writer, index=False, sheet_name=actual_sheet)
+        return [actual_sheet]
+
+    chunk_size = EXCEL_DATA_ROWS_PER_SHEET
+    total_parts = int(math.ceil(rows / float(chunk_size)))
+    if logger is not None:
+        logger(
+            f"Sheet '{sheet_name}' has {rows} rows; splitting into {total_parts} sheets "
+            f"({chunk_size} data rows per sheet)."
+        )
+
+    written = []
+    for part_index, start in enumerate(range(0, rows, chunk_size), start=1):
+        stop = min(start + chunk_size, rows)
+        base = _chunked_sheet_base_name(sheet_name, part_index)
+        actual_sheet = _unique_sheet_name(base, used)
+        frame.iloc[start:stop].to_excel(writer, index=False, sheet_name=actual_sheet)
+        written.append(actual_sheet)
+    return written
 
 
 def click_button(window, title):
@@ -950,7 +994,7 @@ def run_spectrum_gui(args, logger=print):
 
                 row_count = len(df)
                 sheet_name = _unique_sheet_name(node_name, used_sheet_names)
-                df.to_excel(writer, index=False, sheet_name=sheet_name)
+                _write_dataframe_excel_sheet(writer, df, sheet_name, logger=logger)
 
                 y_name = f"{safe_label(node_name)}_{args.y_col}"
                 pair_df = df[[args.x_col, args.y_col]].rename(columns={args.y_col: y_name})
@@ -990,8 +1034,13 @@ def run_spectrum_gui(args, logger=print):
                 continue
 
         if merged is not None:
-            merged.sort_values(args.x_col).to_excel(writer, index=False, sheet_name="Merged")
-        pd.DataFrame(status_rows).to_excel(writer, index=False, sheet_name="_Status")
+            _write_dataframe_excel_sheet(
+                writer,
+                merged.sort_values(args.x_col),
+                "Merged",
+                logger=logger,
+            )
+        _write_dataframe_excel_sheet(writer, pd.DataFrame(status_rows), "_Status", logger=logger)
 
     if success_count == 0:
         first_error = ""
@@ -1249,8 +1298,8 @@ def run_timehistory_api(args, logger=print):
         else:
             writer, out_path_final = _open_excel_writer_with_fallback(out_path, logger=logger)
             with writer:
-                history_df.to_excel(writer, index=False, sheet_name="TimeHistory")
-                node_map_df.to_excel(writer, index=False, sheet_name="NodeMap")
+                _write_dataframe_excel_sheet(writer, history_df, "TimeHistory", logger=logger)
+                _write_dataframe_excel_sheet(writer, node_map_df, "NodeMap", logger=logger)
 
         logger(f"OK -> {out_path_final}")
     finally:
@@ -1666,14 +1715,24 @@ def run_curvepoints_api_export(args, logger=print):
         else:
             writer, out_path_final = _open_excel_writer_with_fallback(out_path, logger=logger)
             with writer:
-                history_df.to_excel(writer, index=False, sheet_name="TimeHistory")
+                _write_dataframe_excel_sheet(writer, history_df, "TimeHistory", logger=logger)
                 if velocity_df is not None:
-                    velocity_df.to_excel(writer, index=False, sheet_name="VelocityHistory")
+                    _write_dataframe_excel_sheet(
+                        writer,
+                        velocity_df,
+                        "VelocityHistory",
+                        logger=logger,
+                    )
                 if displacement_df is not None:
-                    displacement_df.to_excel(writer, index=False, sheet_name="DisplacementHistory")
-                spectrum_df.to_excel(writer, index=False, sheet_name="Spectrum")
-                node_map_df.to_excel(writer, index=False, sheet_name="NodeMap")
-                status_df.to_excel(writer, index=False, sheet_name="_Status")
+                    _write_dataframe_excel_sheet(
+                        writer,
+                        displacement_df,
+                        "DisplacementHistory",
+                        logger=logger,
+                    )
+                _write_dataframe_excel_sheet(writer, spectrum_df, "Spectrum", logger=logger)
+                _write_dataframe_excel_sheet(writer, node_map_df, "NodeMap", logger=logger)
+                _write_dataframe_excel_sheet(writer, status_df, "_Status", logger=logger)
 
             logger(f"OK -> {out_path_final} ({len(value_cols)} series)")
     finally:
@@ -1995,10 +2054,16 @@ def _derive_output_with_suffix(base_out_path, suffix):
 
 def _write_multisheet_workbook(out_path, sheets, logger=print):
     writer, out_final = _open_excel_writer_with_fallback(Path(out_path), logger=logger)
+    used_sheet_names = set()
     with writer:
         for sheet_name, df in sheets:
-            frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
-            frame.to_excel(writer, index=False, sheet_name=sheet_name)
+            _write_dataframe_excel_sheet(
+                writer,
+                df,
+                sheet_name,
+                logger=logger,
+                used_names=used_sheet_names,
+            )
     return out_final
 
 
